@@ -48,6 +48,8 @@ All connected sockets go through the same handshake path:
 4. Track remote replication descriptors.
 5. Start Corestore replication.
 
+Handshake frames are read in exact byte lengths using the socket `readable` interface (not streaming `data` listeners). This avoids byte-boundary races when handing control from the custom handshake framing to Hypercore replication on the same socket.
+
 `PeerHello` is transport-scoped, not protocol-object-scoped. It still has its own transport version, but peers now also advertise the protocol families and major versions they support. That gives the higher protocol layer room to evolve independently from the transport handshake.
 
 ## Topic Model

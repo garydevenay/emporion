@@ -95,69 +95,99 @@ async function writeFrame(socket: NoiseSocket, payload: PeerHello): Promise<void
   }
 }
 
+function remainingTimeoutMs(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
+async function readExactBytes(socket: NoiseSocket, byteLength: number, deadline: number): Promise<Buffer> {
+  if (byteLength <= 0) {
+    return Buffer.alloc(0);
+  }
+
+  const chunks: Buffer[] = [];
+  let remaining = byteLength;
+
+  while (remaining > 0) {
+    const chunk = socket.read(remaining) as Buffer | null;
+    if (chunk && chunk.byteLength > 0) {
+      chunks.push(chunk);
+      remaining -= chunk.byteLength;
+      continue;
+    }
+
+    if (socket.destroyed || socket.readableEnded) {
+      throw new HandshakeError("Peer closed the connection before completing the handshake");
+    }
+
+    const waitMs = remainingTimeoutMs(deadline);
+    if (waitMs === 0) {
+      throw new HandshakeError("Peer handshake timed out while waiting for frame bytes");
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new HandshakeError("Peer handshake timed out while waiting for frame bytes"));
+      }, waitMs);
+
+      function cleanup(): void {
+        clearTimeout(timer);
+        socket.off("readable", onReadable);
+        socket.off("error", onError);
+        socket.off("close", onClose);
+        socket.off("end", onClose);
+      }
+
+      function onReadable(): void {
+        cleanup();
+        resolve();
+      }
+
+      function onError(error: Error): void {
+        cleanup();
+        reject(new HandshakeError("Peer handshake failed while reading remote hello", { cause: error }));
+      }
+
+      function onClose(): void {
+        cleanup();
+        reject(new HandshakeError("Peer closed the connection before completing the handshake"));
+      }
+
+      socket.once("readable", onReadable);
+      socket.once("error", onError);
+      socket.once("close", onClose);
+      socket.once("end", onClose);
+    });
+  }
+
+  if (chunks.length === 1) {
+    const [singleChunk] = chunks;
+    if (singleChunk) {
+      return singleChunk;
+    }
+  }
+
+  return Buffer.concat(chunks, byteLength);
+}
+
 async function readFrame(socket: NoiseSocket, timeoutMs: number): Promise<PeerHello> {
-  let header: Buffer | undefined;
-  let bodyLength = 0;
-  let body = Buffer.alloc(0);
+  const deadline = Date.now() + timeoutMs;
+  const header = await readExactBytes(socket, 4, deadline);
+  const bodyLength = header.readUInt32BE(0);
+  const maxFrameBytes = 256 * 1024;
 
-  return new Promise<PeerHello>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new HandshakeError(`Peer handshake timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
+  if (bodyLength === 0 || bodyLength > maxFrameBytes) {
+    throw new HandshakeError(`Peer hello frame length must be between 1 and ${maxFrameBytes} bytes`);
+  }
 
-    function cleanup(): void {
-      clearTimeout(timer);
-      socket.off("data", onData);
-      socket.off("error", onError);
-      socket.off("close", onClose);
-      socket.off("end", onClose);
-    }
+  const payload = await readExactBytes(socket, bodyLength, deadline);
 
-    function onError(error: Error): void {
-      cleanup();
-      reject(new HandshakeError("Peer handshake failed while reading remote hello", { cause: error }));
-    }
-
-    function onClose(): void {
-      cleanup();
-      reject(new HandshakeError("Peer closed the connection before completing the handshake"));
-    }
-
-    function onData(chunk: Buffer): void {
-      body = Buffer.concat([body, chunk]);
-
-      if (!header && body.byteLength >= 4) {
-        header = body.subarray(0, 4);
-        bodyLength = header.readUInt32BE(0);
-        body = body.subarray(4);
-      }
-
-      if (!header || body.byteLength < bodyLength) {
-        return;
-      }
-
-      const payload = body.subarray(0, bodyLength);
-      const remainder = body.subarray(bodyLength);
-      cleanup();
-
-      if (remainder.byteLength > 0) {
-        socket.unshift(remainder);
-      }
-
-      try {
-        const parsed = JSON.parse(payload.toString("utf8")) as unknown;
-        resolve(validatePeerHello(parsed));
-      } catch (error) {
-        reject(new HandshakeError("Peer sent an invalid hello payload", { cause: error }));
-      }
-    }
-
-    socket.on("data", onData);
-    socket.once("error", onError);
-    socket.once("close", onClose);
-    socket.once("end", onClose);
-  });
+  try {
+    const parsed = JSON.parse(payload.toString("utf8")) as unknown;
+    return validatePeerHello(parsed);
+  } catch (error) {
+    throw new HandshakeError("Peer sent an invalid hello payload", { cause: error });
+  }
 }
 
 export async function performPeerHandshake(

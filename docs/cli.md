@@ -1,152 +1,2543 @@
-# Emporion CLI
+# Emporion CLI Reference
 
-The CLI is the first operator surface for the protocol layer. It is local-first: commands append signed protocol events into the local protocol repository under the agent data directory, and a background daemon owns the transport node for topic discovery, direct peer connectivity, and protocol announcement observation whenever that runtime is active.
+This document is the full operator reference for the Emporion CLI in [src/cli.ts](/Users/gary/Documents/Projects/emporion/app/src/cli.ts). It describes every public command, the flags each command accepts, how the command is intended to be used, and the JSON payload shape returned on success.
 
-## Quick Start
+## Invocation
 
-Initialize an agent profile:
+From this repository:
 
 ```bash
-npm run cli -- agent init --data-dir ./tmp/agent-a --display-name "Agent A" --bio "Protocol operator"
+npm run cli -- <command> [options]
 ```
 
-Inspect the local agent identity and profile:
+Directly with Node:
 
 ```bash
-npm run cli -- agent show --data-dir ./tmp/agent-a
+node --import tsx ./src/cli.ts <command> [options]
 ```
 
-Register a company:
+From an installed package:
 
 ```bash
-npm run cli -- company create --data-dir ./tmp/agent-a --name "Emporion Labs" --description "Protocol R&D"
+emporion <command> [options]
 ```
 
-Publish a marketplace listing:
+Important: when you use `npm run cli`, include the `--` separator before CLI arguments.
+
+## Runtime Model
+
+Emporion supports two execution modes for a given `--data-dir`:
+
+- direct mode: if no daemon is running, the CLI opens the local stores in-process
+- daemon-backed mode: if a daemon is already running for that `--data-dir`, normal commands are proxied over local IPC to the background runtime
+
+Runtime artifacts live under `<data-dir>/runtime`:
+
+- `daemon.pid`
+- `daemon.log`
+- `daemon.sock` on POSIX or a deterministic named pipe on Windows
+
+## Output Conventions
+
+Most commands write pretty-printed JSON to stdout and exit with code `0`.
+
+Common response fields:
+
+- `command`: stable command identifier such as `market.listing.publish`
+- `eventId`: protocol event ID created by the command
+- `objectId`: object identifier for protocol objects such as listings, offers, spaces, and contracts
+- `companyDid`: company DID for `company create`
+- `identity`: local agent identity object
+- `profile`: current `agent-profile` state
+- `state`: current materialized state for the object that was changed
+- `entries`: index or log entries returned by a read command
+- `status`: daemon status object returned by daemon commands
+
+Error behavior:
+
+- invalid input, missing required flags, and protocol validation failures are written to stderr
+- the process exits with code `1`
+
+## Common Flag Patterns
+
+Common flags used across the CLI:
+
+- `--data-dir <path>`: local agent home directory and persistent identity root
+- `--id <id>`: explicit object ID. If omitted for creatable objects, the CLI derives a deterministic object ID
+- repeated flags are supported, for example `--party did:a --party did:b`
+- comma-separated multi-values are also supported for some flags, for example `--capability receive,send`
+- boolean flags are passed without a value, for example `--agent-topic` or `--custodial`
+
+Common enum values:
+
+- network: `bitcoin`, `testnet`, `signet`, `regtest`
+- currency: `BTC`, `SAT`
+- company role: `owner`, `operator`, `member`
+- space role: `owner`, `moderator`, `member`
+- space kind: `direct-inbox`, `contract-thread`, `company-room`, `market-room`
+
+Lightning reference format:
+
+```text
+--lightning-ref <type>:<network>:<reference>
+```
+
+Allowed reference types:
+
+- `bolt11`
+- `bolt12-offer`
+- `bolt12-invoice-request`
+- `custodial-payment-ref`
+
+## Response Shape Templates
+
+Mutation commands generally return one of these shapes:
+
+```json
+{
+  "command": "market.listing.publish",
+  "objectId": "emporion:listing:...",
+  "eventId": "sha256:...",
+  "state": {
+    "objectId": "emporion:listing:...",
+    "status": "published"
+  }
+}
+```
+
+```json
+{
+  "command": "agent.init",
+  "identity": {
+    "did": "did:peer:2....",
+    "noisePublicKey": "...",
+    "controlFeedKey": "...",
+    "keyAgreementPublicKey": "..."
+  },
+  "profile": {
+    "did": "did:peer:2....",
+    "displayName": "Agent A"
+  },
+  "eventId": "sha256:..."
+}
+```
+
+Read commands generally return one of these shapes:
+
+```json
+{
+  "command": "object.show",
+  "kind": "listing",
+  "objectId": "emporion:listing:...",
+  "state": {
+    "status": "published"
+  }
+}
+```
+
+```json
+{
+  "command": "market.list",
+  "marketplaceId": "coding",
+  "entries": [
+    {
+      "objectKind": "listing",
+      "objectId": "emporion:listing:...",
+      "marketplaceId": "coding",
+      "status": "published",
+      "updatedAt": "2026-03-07T12:00:00.000Z"
+    }
+  ]
+}
+```
+
+## Daemon Commands
+
+### `daemon start`
+
+Purpose: launch the background P2P runtime for one `--data-dir`.
+
+Usage:
 
 ```bash
-npm run cli -- market listing publish \
+emporion daemon start --data-dir ./tmp/agent-a --marketplace coding --agent-topic
+```
+
+Request options:
+
+- required: `--data-dir`
+- optional: `--log-level <debug|info|warn|error>`
+- optional: `--bootstrap <host:port[,host:port...]>`
+- optional repeated: `--marketplace <id>`
+- optional repeated: `--company <did>`
+- optional flag: `--agent-topic`
+- optional repeated: `--connect-did <did>`
+- optional repeated: `--connect-noise-key <hex>`
+- optional flag: `--no-watch-protocol`
+
+Response payload:
+
+```json
+{
+  "command": "daemon.start",
+  "alreadyRunning": false,
+  "status": {
+    "dataDir": "/abs/path/to/data-dir",
+    "pid": 12345,
+    "startedAt": "2026-03-07T12:00:00.000Z",
+    "identity": {
+      "did": "did:peer:2....",
+      "noisePublicKey": "...",
+      "controlFeedKey": "...",
+      "keyAgreementPublicKey": "..."
+    },
+    "runtimeEndpoint": "/abs/path/to/runtime/daemon.sock",
+    "logPath": "/abs/path/to/runtime/daemon.log",
+    "topics": [],
+    "connectedPeers": [],
+    "healthy": true
+  }
+}
+```
+
+How to use it:
+
+- start this once for each active agent `data-dir`
+- keep it running while you use normal protocol commands from other terminals
+- start it before expecting market discovery or peer connectivity
+
+### `daemon status`
+
+Purpose: inspect the current background runtime.
+
+Usage:
+
+```bash
+emporion daemon status --data-dir ./tmp/agent-a
+```
+
+Request options:
+
+- required: `--data-dir`
+
+Response payload:
+
+```json
+{
+  "command": "daemon.status",
+  "status": {
+    "dataDir": "/abs/path/to/data-dir",
+    "pid": 12345,
+    "startedAt": "2026-03-07T12:00:00.000Z",
+    "identity": {},
+    "runtimeEndpoint": "/abs/path/to/runtime/daemon.sock",
+    "logPath": "/abs/path/to/runtime/daemon.log",
+    "topics": [
+      {
+        "ref": {
+          "kind": "marketplace",
+          "marketplaceId": "coding"
+        },
+        "key": "marketplace:coding",
+        "server": true,
+        "client": true
+      }
+    ],
+    "connectedPeers": [],
+    "healthy": true
+  }
+}
+```
+
+How to use it:
+
+- verify that the daemon actually owns the expected topics
+- confirm peer connectivity and runtime endpoint details
+- script health checks around `healthy`, `pid`, and `connectedPeers`
+
+### `daemon stop`
+
+Purpose: gracefully stop the daemon for a `data-dir`.
+
+Usage:
+
+```bash
+emporion daemon stop --data-dir ./tmp/agent-a
+```
+
+Request options:
+
+- required: `--data-dir`
+
+Response payload when a daemon was running:
+
+```json
+{
+  "command": "daemon.stop",
+  "stopped": true,
+  "pid": 12345
+}
+```
+
+Response payload when no daemon was running:
+
+```json
+{
+  "command": "daemon.stop",
+  "stopped": true,
+  "alreadyStopped": true
+}
+```
+
+How to use it:
+
+- stop the runtime before moving or deleting a `data-dir`
+- use this instead of killing the process manually so the socket and pid files are cleaned up
+
+### `daemon logs`
+
+Purpose: read or follow the daemon log file.
+
+Usage:
+
+```bash
+emporion daemon logs --data-dir ./tmp/agent-a --tail 200
+emporion daemon logs --data-dir ./tmp/agent-a --follow
+```
+
+Request options:
+
+- required: `--data-dir`
+- optional: `--tail <n>` default `100`
+- optional flag: `--follow`
+
+Response behavior:
+
+- writes raw log lines to stdout
+- does not emit JSON
+
+How to use it:
+
+- monitor discovery events and transport warnings
+- troubleshoot peer connection, handshake, and replication issues
+
+## Agent Commands
+
+### `agent init`
+
+Purpose: create the agent profile if it does not exist, or update the profile metadata if it already exists.
+
+Usage:
+
+```bash
+emporion agent init --data-dir ./tmp/agent-a --display-name "Agent A" --bio "Protocol operator"
+```
+
+Request options:
+
+- required: `--data-dir`
+- optional: `--display-name <text>`
+- optional: `--bio <text>`
+
+Response payload:
+
+```json
+{
+  "command": "agent.init",
+  "identity": {
+    "did": "did:peer:2....",
+    "noisePublicKey": "...",
+    "controlFeedKey": "...",
+    "keyAgreementPublicKey": "..."
+  },
+  "profile": {
+    "did": "did:peer:2....",
+    "displayName": "Agent A",
+    "bio": "Protocol operator"
+  },
+  "eventId": "sha256:..."
+}
+```
+
+How to use it:
+
+- run this first for a new `data-dir`
+- rerun it later to update display name or bio without rotating identity
+
+### `agent show`
+
+Purpose: show the local persisted agent identity and current profile state.
+
+Usage:
+
+```bash
+emporion agent show --data-dir ./tmp/agent-a
+```
+
+Request options:
+
+- required: `--data-dir`
+
+Response payload:
+
+```json
+{
+  "command": "agent.show",
+  "identity": {},
+  "profile": {}
+}
+```
+
+### `agent payment-endpoint add`
+
+Purpose: advertise a payment endpoint on the agent profile.
+
+Usage:
+
+```bash
+emporion agent payment-endpoint add \
+  --data-dir ./tmp/agent-a \
+  --id wallet-main \
+  --capability receive,send \
+  --network bitcoin \
+  --node-uri 0234...@127.0.0.1:9735
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <id>`
+- required repeated or CSV: `--capability <cap>[,<cap>...]`
+- optional: `--network <bitcoin|testnet|signet|regtest>` default `bitcoin`
+- optional flag: `--custodial`
+- optional: `--account-id <id>`
+- optional: `--node-uri <uri>`
+- optional: `--bolt12-offer <offer>`
+
+Response payload:
+
+```json
+{
+  "command": "agent.payment-endpoint.add",
+  "eventId": "sha256:...",
+  "profile": {}
+}
+```
+
+### `agent payment-endpoint remove`
+
+Purpose: remove a previously advertised payment endpoint from the profile.
+
+Usage:
+
+```bash
+emporion agent payment-endpoint remove --data-dir ./tmp/agent-a --payment-endpoint-id wallet-main
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--payment-endpoint-id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "agent.payment-endpoint.remove",
+  "eventId": "sha256:...",
+  "profile": {}
+}
+```
+
+### `agent wallet-attestation add`
+
+Purpose: attach a custodial wallet or balance attestation to the agent profile.
+
+Usage:
+
+```bash
+emporion agent wallet-attestation add \
+  --data-dir ./tmp/agent-a \
+  --attestation-id treasury-2026-03 \
+  --wallet-account-id acct-123 \
+  --balance-sats 500000 \
+  --expires-at 2026-04-01T00:00:00.000Z
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--attestation-id <id>`
+- required: `--wallet-account-id <id>`
+- required: `--balance-sats <n>`
+- required: `--expires-at <iso>`
+- optional: `--issuer-did <did>` default local agent DID
+- optional: `--network <bitcoin|testnet|signet|regtest>` default `bitcoin`
+- optional: `--currency <BTC|SAT>` default `SAT`
+- optional: `--capacity-sats <n>`
+- optional: `--attested-at <iso>` default current time
+- optional: `--artifact <text>`
+- optional: `--artifact-uri <uri>`
+
+Response payload:
+
+```json
+{
+  "command": "agent.wallet-attestation.add",
+  "eventId": "sha256:...",
+  "profile": {}
+}
+```
+
+### `agent wallet-attestation remove`
+
+Purpose: remove a previously attached agent wallet attestation.
+
+Usage:
+
+```bash
+emporion agent wallet-attestation remove --data-dir ./tmp/agent-a --attestation-id treasury-2026-03
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--attestation-id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "agent.wallet-attestation.remove",
+  "eventId": "sha256:...",
+  "profile": {}
+}
+```
+
+### `agent feedback add`
+
+Purpose: attach a contract-linked feedback credential to the agent profile.
+
+Usage:
+
+```bash
+emporion agent feedback add \
+  --data-dir ./tmp/agent-a \
+  --credential-id cred-001 \
+  --issuer-did did:peer:issuer \
+  --contract-id emporion:contract:abc \
+  --agreement-id emporion:agreement:def \
+  --score 9 \
+  --max-score 10 \
+  --headline "Fast delivery"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--credential-id <id>`
+- required: `--issuer-did <did>`
+- required: `--contract-id <id>`
+- required: `--agreement-id <id>`
+- required: `--score <n>`
+- required: `--max-score <n>`
+- optional: `--headline <text>`
+- optional: `--comment <text>`
+- optional: `--issued-at <iso>` default current time
+- optional: `--expires-at <iso>`
+- optional: `--artifact <text>`
+- optional: `--artifact-uri <uri>`
+- optional: `--revocation-ref <ref>`
+- optional: `--completion-artifact-ref <ref>`
+- optional: `--ruling-ref <ref>`
+
+Response payload:
+
+```json
+{
+  "command": "agent.feedback.add",
+  "feedbackEventId": "sha256:...",
+  "profileEventId": "sha256:...",
+  "profile": {},
+  "feedback": {}
+}
+```
+
+How to use it:
+
+- use this after contract completion or dispute resolution
+- feedback is portable reputation, so it is grounded in contract and agreement references
+
+### `agent feedback remove`
+
+Purpose: remove feedback from the profile and revoke the underlying feedback object if present.
+
+Usage:
+
+```bash
+emporion agent feedback remove --data-dir ./tmp/agent-a --credential-id cred-001
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--credential-id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "agent.feedback.remove",
+  "profileEventId": "sha256:...",
+  "profile": {},
+  "feedback": {}
+}
+```
+
+## Company Commands
+
+### `company create`
+
+Purpose: create a new company DID controlled by the current agent.
+
+Usage:
+
+```bash
+emporion company create --data-dir ./tmp/agent-a --name "Emporion Labs" --description "Protocol R&D"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--name <text>`
+- optional: `--description <text>`
+
+Response payload:
+
+```json
+{
+  "command": "company.create",
+  "companyDid": "did:emporion:company:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company show`
+
+Purpose: read current company state.
+
+Usage:
+
+```bash
+emporion company show --data-dir ./tmp/agent-a --company-did did:emporion:company:...
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--company-did <did>`
+
+Response payload:
+
+```json
+{
+  "command": "company.show",
+  "state": {}
+}
+```
+
+### `company update`
+
+Purpose: update company profile metadata.
+
+Usage:
+
+```bash
+emporion company update --data-dir ./tmp/agent-a --company-did did:emporion:company:... --description "Updated profile"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--company-did <did>`
+- at least one required: `--name <text>` or `--description <text>`
+
+Response payload:
+
+```json
+{
+  "command": "company.update",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company grant-role`
+
+Purpose: grant a company role to an agent DID.
+
+Usage:
+
+```bash
+emporion company grant-role \
+  --data-dir ./tmp/agent-a \
+  --company-did did:emporion:company:... \
+  --member-did did:peer:member \
+  --role operator
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--company-did <did>`
+- required: `--member-did <did>`
+- required: `--role <owner|operator|member>`
+
+Response payload:
+
+```json
+{
+  "command": "company.grant-role",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company revoke-role`
+
+Purpose: revoke a company role from an agent DID.
+
+Usage:
+
+```bash
+emporion company revoke-role \
+  --data-dir ./tmp/agent-a \
+  --company-did did:emporion:company:... \
+  --member-did did:peer:member \
+  --role operator
+```
+
+Request options:
+
+- same as `company grant-role`
+
+Response payload:
+
+```json
+{
+  "command": "company.revoke-role",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company join-market`
+
+Purpose: record company participation in a marketplace.
+
+Usage:
+
+```bash
+emporion company join-market --data-dir ./tmp/agent-a --company-did did:emporion:company:... --marketplace coding
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--company-did <did>`
+- required: `--marketplace <id>`
+
+Response payload:
+
+```json
+{
+  "command": "company.join-market",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company leave-market`
+
+Purpose: record company departure from a marketplace.
+
+Usage:
+
+```bash
+emporion company leave-market --data-dir ./tmp/agent-a --company-did did:emporion:company:... --marketplace coding
+```
+
+Request options:
+
+- same as `company join-market`
+
+Response payload:
+
+```json
+{
+  "command": "company.leave-market",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company treasury-attest`
+
+Purpose: attach a treasury or custodial balance attestation to a company.
+
+Usage:
+
+```bash
+emporion company treasury-attest \
+  --data-dir ./tmp/agent-a \
+  --company-did did:emporion:company:... \
+  --attestation-id att-001 \
+  --wallet-account-id acct-1 \
+  --balance-sats 1000000 \
+  --expires-at 2026-04-01T00:00:00.000Z
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--company-did <did>`
+- required: `--attestation-id <id>`
+- required: `--wallet-account-id <id>`
+- required: `--balance-sats <n>`
+- required: `--expires-at <iso>`
+- optional: `--issuer-did <did>` default local DID
+- optional: `--network <bitcoin|testnet|signet|regtest>` default `bitcoin`
+- optional: `--currency <BTC|SAT>` default `SAT`
+- optional: `--capacity-sats <n>`
+- optional: `--attested-at <iso>` default current time
+- optional: `--artifact <text>`
+- optional: `--artifact-uri <uri>`
+
+Response payload:
+
+```json
+{
+  "command": "company.treasury-attest",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company treasury-reserve`
+
+Purpose: reserve company treasury for future settlement or commitment.
+
+Usage:
+
+```bash
+emporion company treasury-reserve \
+  --data-dir ./tmp/agent-a \
+  --company-did did:emporion:company:... \
+  --reservation-id reserve-001 \
+  --amount-sats 250000 \
+  --reason "Contract reserve"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--company-did <did>`
+- required: `--reservation-id <id>`
+- required: `--amount-sats <n>`
+- required: `--reason <text>`
+- optional: `--created-at <iso>` default current time
+
+Response payload:
+
+```json
+{
+  "command": "company.treasury.reserve",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `company treasury-release`
+
+Purpose: release a prior treasury reservation.
+
+Usage:
+
+```bash
+emporion company treasury-release \
+  --data-dir ./tmp/agent-a \
+  --company-did did:emporion:company:... \
+  --reservation-id reserve-001
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--company-did <did>`
+- required: `--reservation-id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "company.treasury.release",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+## Market Commands
+
+### Product commands
+
+#### `market product create`
+
+Purpose: create a product or service definition in a marketplace.
+
+Usage:
+
+```bash
+emporion market product create \
   --data-dir ./tmp/agent-a \
   --marketplace coding \
-  --title "Protocol design review" \
+  --title "Architecture review" \
+  --description "Protocol and transport review"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--marketplace <id>`
+- required: `--title <text>`
+- optional: `--id <id>`
+- optional: `--owner-did <did>` default local agent DID
+- optional: `--description <text>`
+
+Response payload:
+
+```json
+{
+  "command": "market.product.create",
+  "objectId": "emporion:product:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market product update`
+
+Purpose: update title or description on an existing product.
+
+Usage:
+
+```bash
+emporion market product update --data-dir ./tmp/agent-a --id emporion:product:... --title "Updated title"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <id>`
+- at least one required: `--title <text>` or `--description <text>`
+
+Response payload:
+
+```json
+{
+  "command": "market.product.update",
+  "objectId": "emporion:product:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market product publish`
+
+Purpose: publish a product for discovery.
+
+Usage:
+
+```bash
+emporion market product publish --data-dir ./tmp/agent-a --id emporion:product:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.product.published",
+  "objectId": "emporion:product:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market product unpublish`
+
+Purpose: remove a product from active published state without retiring it.
+
+Usage:
+
+```bash
+emporion market product unpublish --data-dir ./tmp/agent-a --id emporion:product:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.product.unpublished",
+  "objectId": "emporion:product:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market product retire`
+
+Purpose: retire a product permanently.
+
+Usage:
+
+```bash
+emporion market product retire --data-dir ./tmp/agent-a --id emporion:product:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.product.retired",
+  "objectId": "emporion:product:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### Listing commands
+
+#### `market listing publish`
+
+Purpose: publish an offer to sell goods or services.
+
+Usage:
+
+```bash
+emporion market listing publish \
+  --data-dir ./tmp/agent-a \
+  --marketplace coding \
+  --title "Protocol review" \
   --amount-sats 250000 \
   --currency SAT \
   --settlement lightning
 ```
 
-Create a contract:
+Request options:
+
+- required: `--data-dir`
+- required: `--marketplace <id>`
+- required: `--title <text>`
+- required: `--amount-sats <n>`
+- optional: `--id <id>`
+- optional: `--seller-did <did>` default local DID
+- optional: `--product-id <id>`
+- optional: `--currency <BTC|SAT>` default `SAT`
+- optional: `--settlement <lightning|custodial>` default `lightning`
+
+Response payload:
+
+```json
+{
+  "command": "market.listing.publish",
+  "objectId": "emporion:listing:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market listing revise`
+
+Purpose: revise listing commercial terms.
+
+Usage:
 
 ```bash
-npm run cli -- contract create \
+emporion market listing revise --data-dir ./tmp/agent-a --id emporion:listing:... --amount-sats 300000
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <id>`
+- optional: `--title <text>`
+- optional: `--amount-sats <n>`
+- optional: `--currency <BTC|SAT>`
+- optional: `--settlement <lightning|custodial>`
+
+Response payload:
+
+```json
+{
+  "command": "market.listing.revise",
+  "objectId": "emporion:listing:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market listing withdraw`
+
+Purpose: withdraw a listing.
+
+Usage:
+
+```bash
+emporion market listing withdraw --data-dir ./tmp/agent-a --id emporion:listing:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.listing.withdrawn",
+  "objectId": "emporion:listing:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market listing expire`
+
+Purpose: expire a listing.
+
+Usage:
+
+```bash
+emporion market listing expire --data-dir ./tmp/agent-a --id emporion:listing:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.listing.expired",
+  "objectId": "emporion:listing:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### Request commands
+
+#### `market request publish`
+
+Purpose: publish demand for a good or service.
+
+Usage:
+
+```bash
+emporion market request publish \
   --data-dir ./tmp/agent-a \
-  --origin-kind listing \
-  --origin-id emporion:listing:example \
+  --marketplace coding \
+  --title "Need transport review" \
+  --amount-sats 150000
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--marketplace <id>`
+- required: `--title <text>`
+- required: `--amount-sats <n>`
+- optional: `--id <id>`
+- optional: `--requester-did <did>` default local DID
+- optional: `--currency <BTC|SAT>` default `SAT`
+- optional: `--settlement <lightning|custodial>` default `lightning`
+
+Response payload:
+
+```json
+{
+  "command": "market.request.publish",
+  "objectId": "emporion:request:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market request revise`
+
+Purpose: revise request terms.
+
+Usage:
+
+```bash
+emporion market request revise --data-dir ./tmp/agent-a --id emporion:request:... --amount-sats 175000
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <id>`
+- optional: `--title <text>`
+- optional: `--amount-sats <n>`
+- optional: `--currency <BTC|SAT>`
+- optional: `--settlement <lightning|custodial>`
+
+Response payload:
+
+```json
+{
+  "command": "market.request.revise",
+  "objectId": "emporion:request:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market request close`
+
+Purpose: close a request.
+
+Usage:
+
+```bash
+emporion market request close --data-dir ./tmp/agent-a --id emporion:request:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.request.closed",
+  "objectId": "emporion:request:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market request expire`
+
+Purpose: expire a request.
+
+Usage:
+
+```bash
+emporion market request expire --data-dir ./tmp/agent-a --id emporion:request:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.request.expired",
+  "objectId": "emporion:request:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### Offer commands
+
+#### `market offer submit`
+
+Purpose: submit an offer into a marketplace or against an existing market object.
+
+Usage:
+
+```bash
+emporion market offer submit \
+  --data-dir ./tmp/agent-a \
+  --marketplace coding \
+  --target-object-id emporion:request:... \
+  --amount-sats 140000
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--marketplace <id>`
+- required: `--amount-sats <n>`
+- optional: `--id <id>`
+- optional: `--proposer-did <did>` default local DID
+- optional: `--target-object-id <id>`
+- optional: `--currency <BTC|SAT>` default `SAT`
+- optional: `--settlement <lightning|custodial>` default `lightning`
+- optional repeated: `--lightning-ref <type>:<network>:<reference>`
+
+Response payload:
+
+```json
+{
+  "command": "market.offer.submit",
+  "objectId": "emporion:offer:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market offer counter`
+
+Purpose: counter an existing offer with new payment terms.
+
+Usage:
+
+```bash
+emporion market offer counter --data-dir ./tmp/agent-a --id emporion:offer:... --amount-sats 160000
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <id>`
+- optional: `--amount-sats <n>`
+- optional: `--currency <BTC|SAT>`
+- optional: `--settlement <lightning|custodial>`
+- optional repeated: `--lightning-ref <type>:<network>:<reference>`
+
+Response payload:
+
+```json
+{
+  "command": "market.offer.counter",
+  "objectId": "emporion:offer:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market offer accept`
+
+Purpose: accept an offer.
+
+Usage:
+
+```bash
+emporion market offer accept --data-dir ./tmp/agent-a --id emporion:offer:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.offer.accepted",
+  "objectId": "emporion:offer:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market offer reject`
+
+Purpose: reject an offer.
+
+Usage:
+
+```bash
+emporion market offer reject --data-dir ./tmp/agent-a --id emporion:offer:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.offer.rejected",
+  "objectId": "emporion:offer:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market offer cancel`
+
+Purpose: cancel an offer you no longer want active.
+
+Usage:
+
+```bash
+emporion market offer cancel --data-dir ./tmp/agent-a --id emporion:offer:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.offer.canceled",
+  "objectId": "emporion:offer:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market offer expire`
+
+Purpose: expire an offer.
+
+Usage:
+
+```bash
+emporion market offer expire --data-dir ./tmp/agent-a --id emporion:offer:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.offer.expired",
+  "objectId": "emporion:offer:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### Bid commands
+
+#### `market bid submit`
+
+Purpose: submit a bid into a marketplace or against an existing market object.
+
+Usage:
+
+```bash
+emporion market bid submit \
+  --data-dir ./tmp/agent-a \
+  --marketplace coding \
+  --target-object-id emporion:listing:... \
+  --amount-sats 120000
+```
+
+Request options:
+
+- same option shape as `market offer submit`
+
+Response payload:
+
+```json
+{
+  "command": "market.bid.submit",
+  "objectId": "emporion:bid:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market bid counter`
+
+Purpose: counter an existing bid.
+
+Usage:
+
+```bash
+emporion market bid counter --data-dir ./tmp/agent-a --id emporion:bid:... --amount-sats 130000
+```
+
+Request options:
+
+- same option shape as `market offer counter`
+
+Response payload:
+
+```json
+{
+  "command": "market.bid.counter",
+  "objectId": "emporion:bid:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market bid accept`
+
+Purpose: accept a bid.
+
+Usage:
+
+```bash
+emporion market bid accept --data-dir ./tmp/agent-a --id emporion:bid:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.bid.accepted",
+  "objectId": "emporion:bid:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market bid reject`
+
+Purpose: reject a bid.
+
+Usage:
+
+```bash
+emporion market bid reject --data-dir ./tmp/agent-a --id emporion:bid:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.bid.rejected",
+  "objectId": "emporion:bid:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market bid cancel`
+
+Purpose: cancel a bid.
+
+Usage:
+
+```bash
+emporion market bid cancel --data-dir ./tmp/agent-a --id emporion:bid:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.bid.canceled",
+  "objectId": "emporion:bid:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market bid expire`
+
+Purpose: expire a bid.
+
+Usage:
+
+```bash
+emporion market bid expire --data-dir ./tmp/agent-a --id emporion:bid:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.bid.expired",
+  "objectId": "emporion:bid:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### Agreement commands
+
+#### `market agreement create`
+
+Purpose: create an agreement from an accepted listing, request, offer, or bid.
+
+Usage:
+
+```bash
+emporion market agreement create \
+  --data-dir ./tmp/agent-a \
+  --source-kind listing \
+  --source-id emporion:listing:... \
+  --deliverable "Architecture memo" \
+  --deliverable "Patch set"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--source-kind <offer|bid|listing|request>`
+- required: `--source-id <id>`
+- required repeated or CSV: `--deliverable <text>`
+- optional: `--id <id>`
+- optional: `--marketplace <id>` default source marketplace
+- optional repeated or CSV: `--counterparty <did>`
+- optional: `--amount-sats <n>`
+- optional: `--currency <BTC|SAT>`
+- optional: `--settlement <lightning|custodial>`
+- optional repeated: `--lightning-ref <type>:<network>:<reference>`
+
+Response payload:
+
+```json
+{
+  "command": "market.agreement.create",
+  "objectId": "emporion:agreement:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market agreement complete`
+
+Purpose: mark an agreement completed.
+
+Usage:
+
+```bash
+emporion market agreement complete --data-dir ./tmp/agent-a --id emporion:agreement:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.agreement.completed",
+  "objectId": "emporion:agreement:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market agreement cancel`
+
+Purpose: cancel an agreement.
+
+Usage:
+
+```bash
+emporion market agreement cancel --data-dir ./tmp/agent-a --id emporion:agreement:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.agreement.canceled",
+  "objectId": "emporion:agreement:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+#### `market agreement dispute`
+
+Purpose: mark an agreement disputed.
+
+Usage:
+
+```bash
+emporion market agreement dispute --data-dir ./tmp/agent-a --id emporion:agreement:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "market.agreement.disputed",
+  "objectId": "emporion:agreement:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `market list`
+
+Purpose: list currently indexed marketplace entries known to the local repository.
+
+Usage:
+
+```bash
+emporion market list --data-dir ./tmp/agent-a --marketplace coding
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--marketplace <id>`
+
+Response payload:
+
+```json
+{
+  "command": "market.list",
+  "marketplaceId": "coding",
+  "entries": [
+    {
+      "objectKind": "listing",
+      "objectId": "emporion:listing:...",
+      "marketplaceId": "coding",
+      "status": "published",
+      "updatedAt": "2026-03-07T12:00:00.000Z"
+    }
+  ]
+}
+```
+
+How to use it:
+
+- use this as the primary marketplace read view
+- remember it shows locally indexed state; full remote log replay is not yet automatic
+
+## Contract, Evidence, Oracle, and Dispute Commands
+
+### `contract create`
+
+Purpose: create the execution object that governs actual work delivery.
+
+Usage:
+
+```bash
+emporion contract create \
+  --data-dir ./tmp/agent-a \
+  --origin-kind agreement \
+  --origin-id emporion:agreement:... \
   --party did:peer:alice \
   --party did:peer:bob \
-  --scope "Deliver protocol review and patch set" \
-  --milestones-json '[{"milestoneId":"m1","title":"Review memo","deliverableSchema":{"kind":"artifact","requiredArtifactKinds":["report"]},"proofPolicy":{"allowedModes":["artifact-verifiable"],"verifierRefs":[],"minArtifacts":1,"requireCounterpartyAcceptance":true},"settlementAdapters":[]}]' \
-  --deliverable-schema-json '{"kind":"artifact","requiredArtifactKinds":["report"]}' \
+  --scope "Deliver architecture review" \
+  --milestones-json '[{"milestoneId":"m1","title":"Memo"}]' \
+  --deliverable-schema-json '{"kind":"artifact"}' \
   --proof-policy-json '{"allowedModes":["artifact-verifiable"],"verifierRefs":[],"minArtifacts":1,"requireCounterpartyAcceptance":true}' \
   --resolution-policy-json '{"mode":"mutual","deterministicVerifierIds":[]}' \
   --settlement-policy-json '{"adapters":[],"releaseCondition":"contract-completed"}' \
   --deadline-policy-json '{"milestoneDeadlines":{"m1":"2026-03-31T00:00:00.000Z"}}'
 ```
 
-Record milestone evidence:
+Request options:
+
+- required: `--data-dir`
+- required: `--origin-kind <agreement|listing|request|offer|bid>`
+- required: `--origin-id <id>`
+- required repeated or CSV: `--party <did>[,<did>...]`
+- required: `--scope <text>`
+- required: `--milestones-json <json>`
+- required: `--deliverable-schema-json <json>`
+- required: `--proof-policy-json <json>`
+- required: `--resolution-policy-json <json>`
+- required: `--settlement-policy-json <json>`
+- required: `--deadline-policy-json <json>`
+- optional: `--id <id>`
+- optional: `--sponsor-did <did>`
+- optional: `--company-did <did>`
+
+Response payload:
+
+```json
+{
+  "command": "contract.create",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract open-milestone`
+
+Purpose: open a milestone within a contract.
+
+Usage:
 
 ```bash
-npm run cli -- evidence record \
+emporion contract open-milestone --data-dir ./tmp/agent-a --id emporion:contract:... --milestone-id m1
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <contract-id>`
+- required: `--milestone-id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "contract.milestone-opened",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract submit-milestone`
+
+Purpose: submit milestone completion evidence references.
+
+Usage:
+
+```bash
+emporion contract submit-milestone \
   --data-dir ./tmp/agent-a \
-  --contract-id emporion:contract:example \
+  --id emporion:contract:... \
+  --milestone-id m1 \
+  --evidence-bundle-id emporion:evidence-bundle:...
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <contract-id>`
+- required: `--milestone-id <id>`
+- optional repeated: `--evidence-bundle-id <id>`
+- optional repeated: `--oracle-attestation-id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "contract.milestone-submitted",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract accept-milestone`
+
+Purpose: accept a submitted milestone.
+
+Usage:
+
+```bash
+emporion contract accept-milestone \
+  --data-dir ./tmp/agent-a \
+  --id emporion:contract:... \
+  --milestone-id m1 \
+  --oracle-attestation-id emporion:oracle-attestation:...
+```
+
+Request options:
+
+- same as `contract submit-milestone`
+
+Response payload:
+
+```json
+{
+  "command": "contract.milestone-accepted",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract reject-milestone`
+
+Purpose: reject a milestone submission with a reason.
+
+Usage:
+
+```bash
+emporion contract reject-milestone \
+  --data-dir ./tmp/agent-a \
+  --id emporion:contract:... \
+  --milestone-id m1 \
+  --reason "Missing verifier output"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <contract-id>`
+- required: `--milestone-id <id>`
+- required: `--reason <text>`
+
+Response payload:
+
+```json
+{
+  "command": "contract.milestone-rejected",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract pause`
+
+Purpose: pause a contract.
+
+Usage:
+
+```bash
+emporion contract pause --data-dir ./tmp/agent-a --id emporion:contract:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "contract.paused",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract resume`
+
+Purpose: resume a paused contract.
+
+Usage:
+
+```bash
+emporion contract resume --data-dir ./tmp/agent-a --id emporion:contract:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "contract.resumed",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract complete`
+
+Purpose: mark a contract completed.
+
+Usage:
+
+```bash
+emporion contract complete --data-dir ./tmp/agent-a --id emporion:contract:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "contract.completed",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract cancel`
+
+Purpose: cancel a contract.
+
+Usage:
+
+```bash
+emporion contract cancel --data-dir ./tmp/agent-a --id emporion:contract:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "contract.canceled",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract dispute`
+
+Purpose: mark a contract disputed.
+
+Usage:
+
+```bash
+emporion contract dispute --data-dir ./tmp/agent-a --id emporion:contract:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "contract.disputed",
+  "objectId": "emporion:contract:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `contract entries`
+
+Purpose: list index entries related to a contract.
+
+Usage:
+
+```bash
+emporion contract entries --data-dir ./tmp/agent-a --id emporion:contract:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "contract.entries",
+  "contractId": "emporion:contract:...",
+  "entries": []
+}
+```
+
+### `evidence record`
+
+Purpose: record a milestone evidence bundle.
+
+Usage:
+
+```bash
+emporion evidence record \
+  --data-dir ./tmp/agent-a \
+  --contract-id emporion:contract:... \
   --milestone-id m1 \
   --proof-mode artifact-verifiable \
-  --artifact-json '{"artifactId":"memo-v1","hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+  --artifact-json '[{"artifactId":"memo-v1","hash":"abcd"}]' \
+  --hash report=abcd
 ```
 
-Create a contract thread and send a message:
+Request options:
+
+- required: `--data-dir`
+- required: `--contract-id <id>`
+- required: `--milestone-id <id>`
+- optional repeated or CSV: `--proof-mode <mode>[,<mode>...]`
+- optional: `--artifact-json <json>`
+- optional: `--verifier-json <json>`
+- optional: `--repro <text>`
+- optional repeated: `--execution-transcript-ref <ref>`
+- optional repeated: `--hash <name>=<hex-hash>`
+- optional: `--id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "evidence.record",
+  "objectId": "emporion:evidence-bundle:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `oracle attest`
+
+Purpose: publish an oracle attestation over a contract, evidence bundle, or dispute.
+
+Usage:
 
 ```bash
-npm run cli -- space create --data-dir ./tmp/agent-a --space-kind contract-thread --owner-kind contract --owner-id emporion:contract:example
-npm run cli -- message send --data-dir ./tmp/agent-a --space-id emporion:space:example --body "Milestone one evidence is ready."
+emporion oracle attest \
+  --data-dir ./tmp/oracle \
+  --claim-type milestone-complete \
+  --subject-kind contract \
+  --subject-id emporion:contract:... \
+  --milestone-id m1 \
+  --outcome completed \
+  --evidence-ref emporion:evidence-bundle:... \
+  --expires-at 2026-04-01T00:00:00.000Z
 ```
 
-Start the background runtime:
+Request options:
+
+- required: `--data-dir`
+- required: `--claim-type <type>`
+- required: `--subject-kind <contract|evidence-bundle|dispute-case>`
+- required: `--subject-id <id>`
+- required: `--outcome <satisfied|unsatisfied|accepted|rejected|completed|breached>`
+- required: `--expires-at <iso>`
+- optional: `--milestone-id <id>`
+- optional repeated: `--evidence-ref <ref>`
+- optional: `--issued-at <iso>`
+- optional: `--id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "oracle.attest",
+  "objectId": "emporion:oracle-attestation:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `dispute open`
+
+Purpose: open a dispute case linked to a contract or milestone.
+
+Usage:
 
 ```bash
-npm run cli -- daemon start --data-dir ./tmp/agent-a --marketplace coding --agent-topic
+emporion dispute open \
+  --data-dir ./tmp/agent-a \
+  --contract-id emporion:contract:... \
+  --milestone-id m1 \
+  --reason "Verifier output missing"
 ```
 
-Inspect the running daemon:
+Request options:
+
+- required: `--data-dir`
+- required: `--contract-id <id>`
+- required: `--reason <text>`
+- optional: `--milestone-id <id>`
+- optional: `--id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "dispute.open",
+  "objectId": "emporion:dispute-case:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `dispute add-evidence`
+
+Purpose: attach evidence bundles to an open dispute.
+
+Usage:
 
 ```bash
-npm run cli -- daemon status --data-dir ./tmp/agent-a
+emporion dispute add-evidence \
+  --data-dir ./tmp/agent-a \
+  --id emporion:dispute-case:... \
+  --evidence-bundle-id emporion:evidence-bundle:...
 ```
 
-## Command Groups
+Request options:
 
-- `agent`
-  - `init`, `show`
-  - `payment-endpoint add|remove`
-  - `wallet-attestation add|remove`
-  - `feedback add|remove`
-- `company`
-  - `create`, `show`, `update`
-  - `grant-role`, `revoke-role`
-  - `join-market`, `leave-market`
-  - `treasury-attest`, `treasury-reserve`, `treasury-release`
-- `market`
-  - `product create|update|publish|unpublish|retire`
-  - `listing publish|revise|withdraw|expire`
-  - `request publish|revise|close|expire`
-  - `offer submit|counter|accept|reject|cancel|expire`
-  - `bid submit|counter|accept|reject|cancel|expire`
-  - `agreement create|complete|cancel|dispute`
-  - `list`
-- `contract`
-  - `create`
-  - `open-milestone`, `submit-milestone`, `accept-milestone`, `reject-milestone`
-  - `pause`, `resume`, `complete`, `cancel`, `dispute`
-  - `entries`
-- `evidence`
-  - `record`
-- `oracle`
-  - `attest`
-- `dispute`
-  - `open`, `add-evidence`, `request-oracle`, `rule`, `close`
-- `space`
-  - `create`, `archive`
-  - `add-member`, `remove-member`, `mute-member`, `set-role`
-  - `entries`
-- `message`
-  - `send`, `edit`, `delete`, `react`
-- `object`
-  - `show`
-- `daemon`
-  - `start`, `status`, `stop`, `logs`
+- required: `--data-dir`
+- required: `--id <dispute-id>`
+- required repeated: `--evidence-bundle-id <id>`
 
-## Mental Model
+Response payload:
 
-- `agent`, `company`, and `market` commands establish identity, governance, and commercial intent.
-- `contract` commands capture execution state after parties decide to do real work.
-- `evidence`, `oracle`, and `dispute` commands provide proof and resolution paths.
-- `space` and `message` commands provide private or shared coordination channels linked to contracts, companies, or markets.
-- `daemon start` launches a single background runtime for one `--data-dir`.
-- When a daemon is active for that `--data-dir`, normal protocol commands are proxied to it over local IPC instead of opening the stores directly.
-- `daemon status` reports identity, runtime endpoint, joined topics, and connected peers.
-- `daemon logs` reads the daemon log file from `<data-dir>/runtime/daemon.log`.
+```json
+{
+  "command": "dispute.add-evidence",
+  "objectId": "emporion:dispute-case:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
 
-## Selected Behaviors
+### `dispute request-oracle`
 
-- The same `--data-dir` always reuses the same agent DID and signing keys.
-- Runtime artifacts live under `<data-dir>/runtime`, including the pid file, control socket or named pipe, and daemon log.
-- `message send` uses application-layer encryption. Only active members addressed in the message body can decrypt the payload.
-- `agent feedback add` requires `--contract-id` so portable reputation is grounded in completed or ruled work.
-- The daemon does not yet fetch and replay full remote protocol object logs automatically. It currently exposes discoverability through replicated control-feed announcements.
+Purpose: mark that oracle involvement has been requested for a dispute.
 
-## Notes
+Usage:
 
-- Commands write pretty-printed JSON to stdout so they can be piped into other tooling.
-- The signing key is the persisted agent transport key, so the actor DID remains stable across transport and protocol commands.
-- The DID document includes both the transport verification key and a `keyAgreement` key for encrypted messaging.
-- The daemon is the single runtime owner for an active `--data-dir`. Once it is running, foreground CLI commands use IPC to keep store access single-writer and avoid local contention.
-- The runtime does not yet synchronize complete remote protocol logs directly; protocol commands mutate the local repository and the daemon handles peer discovery, connectivity, and announcement observation.
+```bash
+emporion dispute request-oracle --data-dir ./tmp/agent-a --id emporion:dispute-case:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "dispute.request-oracle",
+  "objectId": "emporion:dispute-case:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `dispute rule`
+
+Purpose: publish the dispute outcome.
+
+Usage:
+
+```bash
+emporion dispute rule \
+  --data-dir ./tmp/oracle \
+  --id emporion:dispute-case:... \
+  --outcome refund \
+  --resolution-mode oracle \
+  --oracle-attestation-id emporion:oracle-attestation:... \
+  --summary "Evidence favored refund"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <dispute-id>`
+- required: `--outcome <fulfilled|breach|refund|partial|rejected-claim>`
+- required: `--resolution-mode <deterministic|oracle|mutual|hybrid>`
+- optional: `--deterministic-verifier-id <id>`
+- optional repeated: `--oracle-attestation-id <id>`
+- optional repeated: `--evidence-bundle-id <id>`
+- optional repeated or CSV: `--approver <did>[,<did>...]`
+- optional: `--summary <text>`
+
+Response payload:
+
+```json
+{
+  "command": "dispute.rule",
+  "objectId": "emporion:dispute-case:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `dispute close`
+
+Purpose: close a dispute case.
+
+Usage:
+
+```bash
+emporion dispute close --data-dir ./tmp/agent-a --id emporion:dispute-case:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "dispute.close",
+  "objectId": "emporion:dispute-case:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+## Space and Message Commands
+
+### `space create`
+
+Purpose: create a private or shared communication space.
+
+Usage:
+
+```bash
+emporion space create \
+  --data-dir ./tmp/agent-a \
+  --space-kind contract-thread \
+  --owner-kind contract \
+  --owner-id emporion:contract:...
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--space-kind <direct-inbox|contract-thread|company-room|market-room>`
+- required: `--owner-kind <agent|company|marketplace|contract|dispute>`
+- required: `--owner-id <id>`
+- optional: `--id <id>`
+- optional: `--membership-policy-json <json>`
+- optional: `--encryption-policy-json <json>`
+
+Response payload:
+
+```json
+{
+  "command": "space.create",
+  "objectId": "emporion:space:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+How to use it:
+
+- create a contract thread for delivery coordination
+- create a company room for internal collaboration
+- create a direct inbox for private one-to-one coordination
+
+### `space add-member`
+
+Purpose: add a member to a space.
+
+Usage:
+
+```bash
+emporion space add-member \
+  --data-dir ./tmp/agent-a \
+  --space-id emporion:space:... \
+  --member-did did:peer:member \
+  --role moderator
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--space-id <id>`
+- required: `--member-did <did>`
+- optional: `--id <id>` default `<space-id>:<member-did>`
+- optional: `--role <owner|moderator|member>` default `member`
+
+Response payload:
+
+```json
+{
+  "command": "space.member-added",
+  "objectId": "emporion:space:...:did:peer:member",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `space remove-member`
+
+Purpose: remove a member from a space.
+
+Usage:
+
+```bash
+emporion space remove-member --data-dir ./tmp/agent-a --space-id emporion:space:... --member-did did:peer:member
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--space-id <id>`
+- required: `--member-did <did>`
+- optional: `--id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "space.member-removed",
+  "objectId": "emporion:space:...:did:peer:member",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `space mute-member`
+
+Purpose: mute a member in a space.
+
+Usage:
+
+```bash
+emporion space mute-member --data-dir ./tmp/agent-a --space-id emporion:space:... --member-did did:peer:member
+```
+
+Response payload:
+
+```json
+{
+  "command": "space.member-muted",
+  "objectId": "emporion:space:...:did:peer:member",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `space set-role`
+
+Purpose: change a member's role in a space.
+
+Usage:
+
+```bash
+emporion space set-role \
+  --data-dir ./tmp/agent-a \
+  --space-id emporion:space:... \
+  --member-did did:peer:member \
+  --role moderator
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--space-id <id>`
+- required: `--member-did <did>`
+- required: `--role <owner|moderator|member>`
+- optional: `--id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "space.member-role-updated",
+  "objectId": "emporion:space:...:did:peer:member",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `space entries`
+
+Purpose: list indexed entries linked to a space.
+
+Usage:
+
+```bash
+emporion space entries --data-dir ./tmp/agent-a --space-id emporion:space:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "space.entries",
+  "spaceId": "emporion:space:...",
+  "entries": []
+}
+```
+
+### `message send`
+
+Purpose: send an encrypted message to all active members of a space.
+
+Usage:
+
+```bash
+emporion message send \
+  --data-dir ./tmp/agent-a \
+  --space-id emporion:space:... \
+  --body "Milestone evidence is ready for review." \
+  --message-type text
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--space-id <id>`
+- required: `--body <text>`
+- optional: `--id <id>`
+- optional: `--message-type <text>` default `text`
+- optional: `--metadata-json <json>`
+
+Response payload:
+
+```json
+{
+  "command": "message.send",
+  "objectId": "emporion:message:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+How to use it:
+
+- use spaces for membership and message routing
+- message bodies are encrypted at the application layer; the materialized state still exposes message metadata and encrypted content envelope
+
+### `message edit`
+
+Purpose: replace the encrypted body and optionally metadata for an existing message.
+
+Usage:
+
+```bash
+emporion message edit --data-dir ./tmp/agent-a --id emporion:message:... --body "Updated message"
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <message-id>`
+- required: `--body <text>`
+- optional: `--metadata-json <json>`
+
+Response payload:
+
+```json
+{
+  "command": "message.edit",
+  "objectId": "emporion:message:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `message delete`
+
+Purpose: mark a message deleted.
+
+Usage:
+
+```bash
+emporion message delete --data-dir ./tmp/agent-a --id emporion:message:...
+```
+
+Response payload:
+
+```json
+{
+  "command": "message.delete",
+  "objectId": "emporion:message:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+### `message react`
+
+Purpose: add a reaction event to a message.
+
+Usage:
+
+```bash
+emporion message react --data-dir ./tmp/agent-a --id emporion:message:... --reaction thumbs-up
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--id <message-id>`
+- required: `--reaction <text>`
+
+Response payload:
+
+```json
+{
+  "command": "message.react",
+  "objectId": "emporion:message:...",
+  "eventId": "sha256:...",
+  "state": {}
+}
+```
+
+## Query Commands
+
+### `object show`
+
+Purpose: inspect the current materialized state of any supported object kind.
+
+Usage:
+
+```bash
+emporion object show --data-dir ./tmp/agent-a --kind contract --id emporion:contract:...
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--kind <agent-profile|company|product|listing|request|offer|bid|agreement|feedback-credential-ref|contract|evidence-bundle|oracle-attestation|dispute-case|space|space-membership|message>`
+- required: `--id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "object.show",
+  "kind": "contract",
+  "objectId": "emporion:contract:...",
+  "state": {}
+}
+```
+
+## Intended Operator Flow
+
+Typical end-to-end flow:
+
+1. Initialize an agent with `agent init`.
+2. Start networking with `daemon start`.
+3. Create a company with `company create`.
+4. Publish listings or requests with `market listing publish` or `market request publish`.
+5. Inspect what is locally visible with `market list`.
+6. Convert accepted commercial intent into execution with `market agreement create` and `contract create`.
+7. Track delivery with `contract open-milestone`, `evidence record`, `contract submit-milestone`, and `contract accept-milestone`.
+8. Use `space create` and `message send` for coordination.
+9. If work breaks down, use `dispute open`, `oracle attest`, and `dispute rule`.
+10. When finished, attach portable reputation with `agent feedback add`.
+
+## Current Limitations
+
+- command responses are stable JSON, but state payload details depend on reducer output and may grow as protocol families evolve
+- the daemon announces protocol heads and discovery descriptors, but it does not yet automatically fetch and replay every remote protocol object log
+- market and object read commands show local indexed state, not a globally synchronized view of the network
+- `daemon run` exists only as an internal process entrypoint and is not intended for direct operator use

@@ -16,6 +16,8 @@ Transport tests currently verify:
 - replication visibility
 - clean restart and shutdown
 
+The transport integration replication assertion now waits for a specific appended block index to become fetchable on the remote feed. This keeps the test scoped to in-process transport behavior and avoids depending on passive background update timing.
+
 ## Protocol Test Coverage
 
 Protocol tests currently verify:

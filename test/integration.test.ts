@@ -18,6 +18,10 @@ async function createAgentDir(prefix: string): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
+function getSessionForDid(agent: AgentTransport, remoteDid: string) {
+  return [...agent.getPeerSessions().values()].find((session) => session.remoteDid === remoteDid);
+}
+
 test("two agents discover each other, complete the handshake, and replicate the events feed", async () => {
   const bootstrap = await createBootstrapNode();
   const dirA = await createAgentDir("emporion-agent-a-");
@@ -46,11 +50,15 @@ test("two agents discover each other, complete the handshake, and replicate the 
       message: "Agents did not connect through Hyperswarm"
     });
 
+    const sessionOnB = await waitFor(() => getSessionForDid(agentB, agentA.identity.did) ?? null, {
+      timeoutMs: 10_000,
+      message: "Agent B did not register a session for Agent A"
+    });
+    assert.ok(sessionOnB);
+
     const eventsFeedA = await agentA.openFeed("events");
     const feedKey = eventsFeedA.key.toString("hex");
-    const remoteEventsDescriptorOnB = [...agentB.getPeerSessions().values()][0]?.replication.find(
-      (descriptor) => descriptor.name === "events"
-    );
+    const remoteEventsDescriptorOnB = sessionOnB.replication.find((descriptor) => descriptor.name === "events");
     assert.ok(remoteEventsDescriptorOnB);
     assert.equal(remoteEventsDescriptorOnB.key, feedKey);
     await waitFor(() => agentB.getRemoteFeed(remoteEventsDescriptorOnB.key) ?? null, {
@@ -58,26 +66,28 @@ test("two agents discover each other, complete the handshake, and replicate the 
       message: "Remote events feed was not registered on peer B"
     });
 
-    await eventsFeedA.append({
+    const firstAppend = await eventsFeedA.append({
       type: "offer",
       payload: "hello-market",
       createdAt: new Date().toISOString()
     });
+    const firstAppendIndex = firstAppend.length - 1;
 
-    const remoteFeed = await waitFor(async () => {
+    const replicated = await waitFor(async () => {
       const feed = agentB.getRemoteFeed(remoteEventsDescriptorOnB.key) ?? null;
       if (!feed) {
         return null;
       }
 
-      await feed.update({ wait: false });
-      return feed.length >= 1 ? feed : null;
+      try {
+        return await feed.get(firstAppendIndex, { timeout: 250 });
+      } catch {
+        return null;
+      }
     }, {
       timeoutMs: 10_000,
-      message: "Remote events feed was not tracked"
+      message: "Remote events feed did not replicate Agent A's append"
     });
-    assert.ok(remoteFeed);
-    const replicated = await remoteFeed.get(0, { timeout: 5_000 });
     assert.ok(replicated && typeof replicated === "object" && !Array.isArray(replicated));
     const replicatedRecord = replicated as Record<string, unknown>;
 
@@ -89,35 +99,40 @@ test("two agents discover each other, complete the handshake, and replicate the 
     assert.equal(typeof replicatedRecord.createdAt, "string");
 
     const eventsFeedB = await agentB.openFeed("events");
-    const remoteEventsDescriptorOnA = [...agentA.getPeerSessions().values()][0]?.replication.find(
-      (descriptor) => descriptor.name === "events"
-    );
+    const sessionOnA = await waitFor(() => getSessionForDid(agentA, agentB.identity.did) ?? null, {
+      timeoutMs: 10_000,
+      message: "Agent A did not register a session for Agent B"
+    });
+    assert.ok(sessionOnA);
+    const remoteEventsDescriptorOnA = sessionOnA.replication.find((descriptor) => descriptor.name === "events");
     assert.ok(remoteEventsDescriptorOnA);
     await waitFor(() => agentA.getRemoteFeed(remoteEventsDescriptorOnA.key) ?? null, {
       timeoutMs: 10_000,
       message: "Peer A remote events feed was not registered"
     });
 
-    await eventsFeedB.append({
+    const secondAppend = await eventsFeedB.append({
       type: "bid",
       payload: "reply-from-b",
       createdAt: new Date().toISOString()
     });
+    const secondAppendIndex = secondAppend.length - 1;
 
-    const remoteFeedOnA = await waitFor(async () => {
+    const replicatedReply = await waitFor(async () => {
       const feed = agentA.getRemoteFeed(remoteEventsDescriptorOnA.key) ?? null;
       if (!feed) {
         return null;
       }
 
-      await feed.update({ wait: false });
-      return feed.length >= 1 ? feed : null;
+      try {
+        return await feed.get(secondAppendIndex, { timeout: 250 });
+      } catch {
+        return null;
+      }
     }, {
       timeoutMs: 10_000,
       message: "Peer A did not observe the later append from peer B"
     });
-    assert.ok(remoteFeedOnA);
-    const replicatedReply = await remoteFeedOnA.get(0, { timeout: 5_000 });
     assert.ok(replicatedReply && typeof replicatedReply === "object" && !Array.isArray(replicatedReply));
     const replicatedReplyRecord = replicatedReply as Record<string, unknown>;
     assert.equal(replicatedReplyRecord.type, "bid");
