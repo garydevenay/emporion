@@ -93,7 +93,22 @@ Core areas:
 - repository
   - one object log per protocol object plus materialized state
 - CLI
-  - operator-facing interface over the transport and protocol layers
+  - operator-facing interface plus the background daemon and local IPC control plane
+
+## CLI Runtime Model
+
+Emporion now supports two execution modes:
+
+- direct mode: if no daemon is running for a `data-dir`, a CLI command opens the local stores in-process
+- daemon-backed mode: if a daemon is active for that `data-dir`, normal CLI commands proxy over local IPC to the background runtime
+
+Runtime artifacts live under `<data-dir>/runtime`:
+
+- `daemon.pid`
+- `daemon.log`
+- `daemon.sock` on POSIX or a deterministic named pipe on Windows
+
+This is the main protection against multi-process contention on transport and protocol storage. If you change the CLI or runtime behavior, update both the command surface and the daemon path together.
 
 ## Protocol Versioning
 
@@ -150,7 +165,7 @@ Those repo rules are also captured in [AGENTS.md](/Users/gary/Documents/Projects
 The most important current limitations for contributors:
 
 - protocol state is still local-first
-- `serve` disseminates protocol object heads and space descriptors, not full remote object-log synchronization
+- the daemon disseminates protocol object heads and space descriptors, not full remote object-log synchronization
 - encrypted messaging exists at the protocol layer, but chat-style product UX is still minimal
 - settlement is adapter-based metadata, not trustless escrow or automatic Lightning enforcement
 - projection storage is not yet independently schema-versioned beyond log replay, so future projection migrations should be designed carefully

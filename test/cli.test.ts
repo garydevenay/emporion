@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { runCli } from "../src/cli.js";
-import { createBootstrapNode, createTempDir, removeTempDir } from "./helpers.js";
+import { probeDaemonStatus } from "../src/daemon.js";
+import { createBootstrapNode, createTempDir, removeTempDir, waitFor } from "./helpers.js";
 
 function createCaptureIo(): {
   stdout: string[];
@@ -134,15 +135,16 @@ test("CLI can create company and market objects, then list marketplace entries",
   }
 });
 
-test("CLI serve starts and stops cleanly against a custom bootstrap node", async () => {
-  const dataDir = await createTempDir("emporion-cli-serve-");
+test("CLI daemon start, status, and stop work against a custom bootstrap node", async () => {
+  const dataDir = await createTempDir("emporion-cli-daemon-");
   const bootstrapNode = await createBootstrapNode();
 
   try {
-    const capture = createCaptureIo();
-    const exitCode = await runCli(
+    const startCapture = createCaptureIo();
+    const startExitCode = await runCli(
       [
-        "serve",
+        "daemon",
+        "start",
         "--data-dir",
         dataDir,
         "--bootstrap",
@@ -151,18 +153,99 @@ test("CLI serve starts and stops cleanly against a custom bootstrap node", async
         "coding",
         "--agent-topic",
         "--log-level",
-        "error",
-        "--exit-after-ms",
-        "250"
+        "error"
       ],
-      capture.io
+      startCapture.io
+    );
+    assert.equal(startExitCode, 0);
+
+    const startPayload = JSON.parse(startCapture.stdout.join(""));
+    assert.equal(startPayload.status.identity.did.startsWith("did:peer:"), true);
+    assert.equal(startPayload.status.topics.length, 2);
+
+    const statusCapture = createCaptureIo();
+    assert.equal(await runCli(["daemon", "status", "--data-dir", dataDir], statusCapture.io), 0);
+    const statusPayload = JSON.parse(statusCapture.stdout.join(""));
+    assert.equal(statusPayload.status.identity.did, startPayload.status.identity.did);
+    assert.equal(statusPayload.status.healthy, true);
+
+    const stopCapture = createCaptureIo();
+    assert.equal(await runCli(["daemon", "stop", "--data-dir", dataDir], stopCapture.io), 0);
+    const stopPayload = JSON.parse(stopCapture.stdout.join(""));
+    assert.equal(stopPayload.stopped, true);
+    assert.equal(await probeDaemonStatus(dataDir, 500), null);
+  } finally {
+    await Promise.allSettled([runCli(["daemon", "stop", "--data-dir", dataDir]), bootstrapNode.destroy(), removeTempDir(dataDir)]);
+  }
+});
+
+test("CLI proxies protocol commands through a running daemon", async () => {
+  const dataDir = await createTempDir("emporion-cli-daemon-proxy-");
+  const bootstrapNode = await createBootstrapNode();
+
+  try {
+    const startCapture = createCaptureIo();
+    assert.equal(
+      await runCli(
+        [
+          "daemon",
+          "start",
+          "--data-dir",
+          dataDir,
+          "--bootstrap",
+          bootstrapNode.bootstrap[0] as string,
+          "--marketplace",
+          "coding",
+          "--agent-topic",
+          "--log-level",
+          "error"
+        ],
+        startCapture.io
+      ),
+      0
     );
 
-    assert.equal(exitCode, 0);
-    const payload = JSON.parse(capture.stdout.join(""));
-    assert.equal(payload.identity.did.startsWith("did:peer:"), true);
-    assert.equal(payload.topics.length, 2);
+    await waitFor(async () => probeDaemonStatus(dataDir, 500), {
+      message: "Daemon did not become available for proxy test"
+    });
+
+    const companyCapture = createCaptureIo();
+    assert.equal(
+      await runCli(["company", "create", "--data-dir", dataDir, "--name", "Daemon Company"], companyCapture.io),
+      0
+    );
+    const companyPayload = JSON.parse(companyCapture.stdout.join(""));
+    const companyDid = companyPayload.companyDid as string;
+
+    const listingCapture = createCaptureIo();
+    assert.equal(
+      await runCli(
+        [
+          "market",
+          "listing",
+          "publish",
+          "--data-dir",
+          dataDir,
+          "--marketplace",
+          "coding",
+          "--seller-did",
+          companyDid,
+          "--title",
+          "Daemon-backed listing",
+          "--amount-sats",
+          "200000"
+        ],
+        listingCapture.io
+      ),
+      0
+    );
+
+    const listCapture = createCaptureIo();
+    assert.equal(await runCli(["market", "list", "--data-dir", dataDir, "--marketplace", "coding"], listCapture.io), 0);
+    const listPayload = JSON.parse(listCapture.stdout.join(""));
+    assert.equal(Array.isArray(listPayload.entries), true);
+    assert.equal(listPayload.entries.length >= 1, true);
   } finally {
-    await Promise.allSettled([bootstrapNode.destroy(), removeTempDir(dataDir)]);
+    await Promise.allSettled([runCli(["daemon", "stop", "--data-dir", dataDir]), bootstrapNode.destroy(), removeTempDir(dataDir)]);
   }
 });

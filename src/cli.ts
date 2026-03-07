@@ -1,8 +1,29 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { pathToFileURL } from "node:url";
+import { closeSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
+import {
+  AgentDaemon,
+  cleanupStaleDaemonArtifacts,
+  daemonOptionsRecordToMap,
+  daemonRequestFromParsed,
+  daemonRequestOptionsToRecord,
+  ensureDaemonRuntimeDir,
+  getDaemonLogPath,
+  getDaemonPidPath,
+  getLocalControlEndpoint,
+  openDaemonLogFd,
+  probeDaemonStatus,
+  sendDaemonCommand,
+  type DaemonCommandRequest,
+  type DaemonStatus
+} from "./daemon.js";
 import { AgentTransport } from "./transport.js";
 import { createLogger, type LogLevel } from "./logger.js";
 import { loadPersistentIdentityMaterial } from "./persistent-agent.js";
@@ -31,6 +52,11 @@ interface CliContext {
 }
 
 type StateWithLatestEventId = { latestEventId: string; eventIds: string[] };
+type CliContextRunner = <T>(dataDir: string, fn: (context: CliContext) => Promise<T>) => Promise<T>;
+
+interface DispatchOptions {
+  allowDaemonProxy: boolean;
+}
 
 const DEFAULT_IO: CliIo = {
   stdout(message) {
@@ -40,6 +66,8 @@ const DEFAULT_IO: CliIo = {
     process.stderr.write(message);
   }
 };
+
+const CLI_CONTEXT_STORAGE = new AsyncLocalStorage<CliContext>();
 
 function parseArgs(argv: string[]): ParsedArgs {
   const commandPath: string[] = [];
@@ -251,27 +279,48 @@ function writeJson(io: CliIo, value: unknown): void {
   io.stdout(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-async function withCliContext<T>(dataDir: string, fn: (context: CliContext) => Promise<T>): Promise<T> {
+function normalizeDataDirPath(dataDir: string): string {
+  return path.resolve(dataDir);
+}
+
+async function openCliContext(dataDir: string): Promise<CliContext> {
   const identityMaterial = await loadPersistentIdentityMaterial(dataDir);
   const repository = await Protocol.ProtocolRepository.create(dataDir);
   const transportStorage = await TransportStorage.create(dataDir, identityMaterial.storagePrimaryKey, createLogger("error"));
   await transportStorage.initializeDefaults();
 
+  return {
+    dataDir,
+    identityMaterial,
+    repository,
+    transportStorage,
+    signer: {
+      did: identityMaterial.agentIdentity.did,
+      publicKey: identityMaterial.transportKeyPair.publicKey,
+      secretKey: identityMaterial.transportKeyPair.secretKey
+    }
+  };
+}
+
+async function closeCliContext(context: CliContext): Promise<void> {
+  await context.transportStorage.close();
+  await context.repository.close();
+}
+
+async function withCliContext<T>(dataDir: string, fn: (context: CliContext) => Promise<T>): Promise<T> {
+  const sharedContext = CLI_CONTEXT_STORAGE.getStore();
+  if (sharedContext) {
+    if (normalizeDataDirPath(sharedContext.dataDir) !== normalizeDataDirPath(dataDir)) {
+      throw new Error(`Daemon context is bound to ${sharedContext.dataDir}, not ${dataDir}`);
+    }
+    return fn(sharedContext);
+  }
+
+  const context = await openCliContext(dataDir);
   try {
-    return await fn({
-      dataDir,
-      identityMaterial,
-      repository,
-      transportStorage,
-      signer: {
-        did: identityMaterial.agentIdentity.did,
-        publicKey: identityMaterial.transportKeyPair.publicKey,
-        secretKey: identityMaterial.transportKeyPair.secretKey
-      }
-    });
+    return await fn(context);
   } finally {
-    await transportStorage.close();
-    await repository.close();
+    await closeCliContext(context);
   }
 }
 
@@ -2051,104 +2100,6 @@ async function handleMarketList(args: ParsedArgs, io: CliIo): Promise<void> {
   });
 }
 
-async function handleServe(args: ParsedArgs, io: CliIo): Promise<void> {
-  const dataDir = requireOption(args, "data-dir");
-  const logLevel = parseEnum(getOptionalOption(args, "log-level") ?? "info", "--log-level", [
-    "debug",
-    "info",
-    "warn",
-    "error"
-  ] as const) as LogLevel;
-  const bootstrap = getCsvOptionValues(args, "bootstrap");
-  const marketplaces = getCsvOptionValues(args, "marketplace");
-  const companyIds = getCsvOptionValues(args, "company");
-  const connectDids = getCsvOptionValues(args, "connect-did");
-  const connectNoiseKeys = getCsvOptionValues(args, "connect-noise-key");
-  const exitAfterMs = getOptionalOption(args, "exit-after-ms");
-  const watchProtocol = !hasFlag(args, "no-watch-protocol");
-
-  const transportConfig: TransportConfig = {
-    dataDir,
-    logLevel,
-    ...(bootstrap.length > 0 ? { bootstrap } : {})
-  };
-  const transport = await AgentTransport.create(transportConfig);
-  const topics: TopicRef[] = [];
-  const seenControlLengths = new Map<string, number>();
-  const discoveryIntervalMs = 2_000;
-  let discoveryInterval: NodeJS.Timeout | undefined;
-
-  try {
-    await transport.start();
-
-    if (hasFlag(args, "agent-topic")) {
-      topics.push({ kind: "agent", agentDid: transport.identity.did });
-    }
-    for (const marketplaceId of marketplaces) {
-      topics.push({ kind: "marketplace", marketplaceId });
-    }
-    for (const companyId of companyIds) {
-      topics.push({ kind: "company", companyId });
-    }
-
-    for (const topic of topics) {
-      await transport.joinTopic(topic);
-    }
-    for (const did of connectDids) {
-      await transport.connectToDid(did);
-    }
-    for (const publicKey of connectNoiseKeys) {
-      await transport.connectToNoiseKey(publicKey);
-    }
-
-    writeJson(io, {
-      command: "serve",
-      identity: transport.identity,
-      topics,
-      connectedPeers: [...transport.getPeerSessions().values()]
-    });
-
-    if (watchProtocol) {
-      discoveryInterval = setInterval(() => {
-        void (async () => {
-          for (const session of transport.getPeerSessions().values()) {
-            const remoteFeed = transport.getRemoteFeed(session.remoteControlFeedKey);
-            if (!remoteFeed) {
-              continue;
-            }
-            await remoteFeed.update({ wait: false });
-            const seenLength = seenControlLengths.get(session.remoteControlFeedKey) ?? 0;
-            if (remoteFeed.length <= seenLength) {
-              continue;
-            }
-            for (let index = seenLength; index < remoteFeed.length; index += 1) {
-              const entry = await remoteFeed.get(index);
-              if (Protocol.isProtocolAnnouncement(entry)) {
-                io.stdout(`${JSON.stringify({ command: "serve.discovery", remoteDid: session.remoteDid, announcement: entry }, null, 2)}\n`);
-              }
-            }
-            seenControlLengths.set(session.remoteControlFeedKey, remoteFeed.length);
-          }
-        })().catch((error: unknown) => {
-          io.stderr(`${error instanceof Error ? error.message : String(error)}\n`);
-        });
-      }, discoveryIntervalMs);
-    }
-
-    if (exitAfterMs) {
-      await sleep(parsePositiveInteger(exitAfterMs, "--exit-after-ms"));
-      return;
-    }
-
-    await Promise.race([once(process, "SIGINT"), once(process, "SIGTERM")]);
-  } finally {
-    if (discoveryInterval) {
-      clearInterval(discoveryInterval);
-    }
-    await transport.stop();
-  }
-}
-
 function usage(): string {
   return [
     "Usage:",
@@ -2175,229 +2126,578 @@ function usage(): string {
     "  emporion message send --data-dir <path> --space-id <id> --body <text>",
     "  emporion market list --data-dir <path> --marketplace <id>",
     "  emporion object show --data-dir <path> --kind <kind> --id <id>",
-    "  emporion serve --data-dir <path> [--marketplace <id>] [--company <did>] [--agent-topic]"
+    "  emporion daemon start --data-dir <path> [--marketplace <id>] [--company <did>] [--agent-topic]",
+    "  emporion daemon status --data-dir <path>",
+    "  emporion daemon stop --data-dir <path>",
+    "  emporion daemon logs --data-dir <path> [--tail <n>] [--follow]"
   ].join("\n");
+}
+
+function getDataDirFromArgs(args: ParsedArgs): string | undefined {
+  return getOptionalOption(args, "data-dir");
+}
+
+function createCaptureIo(): { stdout: string[]; stderr: string[]; io: CliIo } {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  return {
+    stdout,
+    stderr,
+    io: {
+      stdout(message) {
+        stdout.push(message);
+      },
+      stderr(message) {
+        stderr.push(message);
+      }
+    }
+  };
+}
+
+function buildTransportConfigFromArgs(args: ParsedArgs): TransportConfig {
+  const dataDir = requireOption(args, "data-dir");
+  const logLevel = parseEnum(getOptionalOption(args, "log-level") ?? "info", "--log-level", [
+    "debug",
+    "info",
+    "warn",
+    "error"
+  ] as const) as LogLevel;
+  const bootstrap = getCsvOptionValues(args, "bootstrap");
+  return {
+    dataDir,
+    logLevel,
+    ...(bootstrap.length > 0 ? { bootstrap } : {})
+  };
+}
+
+function buildTopicsFromArgs(args: ParsedArgs, agentDid: string): TopicRef[] {
+  const topics: TopicRef[] = [];
+  if (hasFlag(args, "agent-topic")) {
+    topics.push({ kind: "agent", agentDid });
+  }
+  for (const marketplaceId of getCsvOptionValues(args, "marketplace")) {
+    topics.push({ kind: "marketplace", marketplaceId });
+  }
+  for (const companyId of getCsvOptionValues(args, "company")) {
+    topics.push({ kind: "company", companyId });
+  }
+  return topics;
+}
+
+function getDaemonStartupOptions(args: ParsedArgs): {
+  topics: TopicRef[];
+  connectDids: string[];
+  connectNoiseKeys: string[];
+  watchProtocol: boolean;
+} {
+  return {
+    topics: [],
+    connectDids: getCsvOptionValues(args, "connect-did"),
+    connectNoiseKeys: getCsvOptionValues(args, "connect-noise-key"),
+    watchProtocol: !hasFlag(args, "no-watch-protocol")
+  };
+}
+
+function sanitizeExecArgv(): string[] {
+  return process.execArgv.filter((value) => value !== "--test" && !value.startsWith("--test-"));
+}
+
+function buildDaemonRunArgv(args: ParsedArgs): string[] {
+  const forwarded = new Set([
+    "data-dir",
+    "log-level",
+    "bootstrap",
+    "marketplace",
+    "company",
+    "connect-did",
+    "connect-noise-key",
+    "agent-topic",
+    "no-watch-protocol"
+  ]);
+  const argv = [...sanitizeExecArgv()];
+  argv.push(fileURLToPath(import.meta.url), "daemon", "run");
+  for (const [name, values] of args.options.entries()) {
+    if (!forwarded.has(name)) {
+      continue;
+    }
+    for (const value of values) {
+      argv.push(`--${name}`);
+      if (value !== "true") {
+        argv.push(value);
+      }
+    }
+  }
+  return argv;
+}
+
+function tailText(input: string, lineCount: number): string {
+  if (lineCount <= 0) {
+    return "";
+  }
+  const lines = input.split("\n");
+  const slice = lines.slice(Math.max(lines.length - lineCount - 1, 0)).join("\n");
+  return slice.length > 0 && !slice.endsWith("\n") ? `${slice}\n` : slice;
+}
+
+async function readDaemonLogTail(dataDir: string, lineCount: number): Promise<string> {
+  try {
+    return tailText(await readFile(getDaemonLogPath(dataDir), "utf8"), lineCount);
+  } catch {
+    return "";
+  }
+}
+
+async function waitForDaemonReady(dataDir: string, timeoutMs: number): Promise<DaemonStatus> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: Error | undefined;
+  while (Date.now() < deadline) {
+    try {
+      const status = await probeDaemonStatus(dataDir, 1_000);
+      if (status) {
+        return status;
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+    await sleep(100);
+  }
+  if (lastError) {
+    throw lastError;
+  }
+  throw new Error(`Daemon for ${dataDir} did not become ready within ${timeoutMs}ms`);
+}
+
+async function waitForDaemonExit(dataDir: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const status = await probeDaemonStatus(dataDir, 1_000);
+      if (!status) {
+        return;
+      }
+    } catch {
+      // The daemon may tear down the socket before the pid disappears.
+    }
+    await sleep(100);
+  }
+  throw new Error(`Daemon for ${dataDir} did not stop within ${timeoutMs}ms`);
+}
+
+async function proxyParsedArgsToDaemon(args: ParsedArgs, io: CliIo): Promise<number> {
+  const dataDir = getDataDirFromArgs(args);
+  if (!dataDir) {
+    return 1;
+  }
+
+  const response = await sendDaemonCommand(
+    dataDir,
+    daemonRequestFromParsed(args.commandPath, daemonRequestOptionsToRecord(args.options))
+  );
+  if (!response.ok) {
+    throw new Error(response.error ?? "Daemon command failed");
+  }
+  if (response.result !== undefined) {
+    writeJson(io, response.result);
+  }
+  return 0;
+}
+
+async function executeCapturedInDaemon(args: ParsedArgs): Promise<unknown> {
+  const capture = createCaptureIo();
+  const exitCode = await executeParsedArgs(args, capture.io, { allowDaemonProxy: false });
+  if (exitCode !== 0) {
+    throw new Error(capture.stderr.join("").trim() || "Daemon command failed");
+  }
+  const output = capture.stdout.join("").trim();
+  return output.length === 0 ? null : JSON.parse(output);
+}
+
+async function handleDaemonStart(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const existing = await probeDaemonStatus(dataDir, 1_000);
+  if (existing) {
+    writeJson(io, {
+      command: "daemon.start",
+      alreadyRunning: true,
+      status: existing
+    });
+    return;
+  }
+
+  await ensureDaemonRuntimeDir(dataDir);
+  const logFd = openDaemonLogFd(dataDir);
+  let childError: Error | undefined;
+  try {
+    const child = spawn(process.execPath, buildDaemonRunArgv(args), {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      env: {
+        ...process.env,
+        EMPORION_DAEMON: "1"
+      }
+    });
+    child.once("error", (error) => {
+      childError = error;
+    });
+    child.unref();
+  } finally {
+    closeSync(logFd);
+  }
+
+  if (childError) {
+    throw childError;
+  }
+  const status = await waitForDaemonReady(dataDir, 10_000);
+  writeJson(io, {
+    command: "daemon.start",
+    alreadyRunning: false,
+    status
+  });
+}
+
+async function handleDaemonStatus(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const status = await probeDaemonStatus(dataDir, 1_000);
+  if (!status) {
+    throw new Error(`No daemon is running for ${dataDir}`);
+  }
+  writeJson(io, {
+    command: "daemon.status",
+    status
+  });
+}
+
+async function handleDaemonStop(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const status = await probeDaemonStatus(dataDir, 1_000);
+  if (!status) {
+    await cleanupStaleDaemonArtifacts(dataDir);
+    writeJson(io, {
+      command: "daemon.stop",
+      stopped: true,
+      alreadyStopped: true
+    });
+    return;
+  }
+
+  const response = await sendDaemonCommand(dataDir, {
+    commandPath: ["daemon", "stop"],
+    options: {}
+  });
+  if (!response.ok) {
+    throw new Error(response.error ?? "Daemon stop request failed");
+  }
+  await waitForDaemonExit(dataDir, 10_000);
+  writeJson(io, {
+    command: "daemon.stop",
+    stopped: true,
+    pid: status.pid
+  });
+}
+
+async function handleDaemonLogs(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const tail = parseNonNegativeInteger(getOptionalOption(args, "tail") ?? "100", "--tail");
+  const follow = hasFlag(args, "follow");
+
+  const logPath = getDaemonLogPath(dataDir);
+  let currentContents = await readDaemonLogTail(dataDir, tail);
+  if (currentContents.length > 0) {
+    io.stdout(currentContents);
+  }
+  if (!follow) {
+    return;
+  }
+
+  let stopped = false;
+  const stop = () => {
+    stopped = true;
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+
+  try {
+    try {
+      currentContents = await readFile(logPath, "utf8");
+    } catch {
+      currentContents = "";
+    }
+    let lastLength = currentContents.length;
+    while (!stopped) {
+      await sleep(500);
+      if (stopped) {
+        break;
+      }
+      try {
+        const next = await readFile(logPath, "utf8");
+        if (next.length > lastLength) {
+          io.stdout(next.slice(lastLength));
+        }
+        lastLength = next.length;
+      } catch {
+        // Keep polling while the operator waits for logs to appear.
+      }
+    }
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
+}
+
+async function buildDaemonSharedContext(dataDir: string, transport: AgentTransport): Promise<CliContext> {
+  const identityMaterial = transport.getIdentityMaterial();
+  const repository = await Protocol.ProtocolRepository.create(dataDir);
+  return {
+    dataDir,
+    identityMaterial,
+    repository,
+    transportStorage: transport.getStorage(),
+    signer: {
+      did: identityMaterial.agentIdentity.did,
+      publicKey: identityMaterial.transportKeyPair.publicKey,
+      secretKey: identityMaterial.transportKeyPair.secretKey
+    }
+  };
+}
+
+function buildDaemonStatus(dataDir: string, startedAt: string, transport: AgentTransport): DaemonStatus {
+  return {
+    dataDir: normalizeDataDirPath(dataDir),
+    pid: process.pid,
+    startedAt,
+    identity: transport.identity,
+    runtimeEndpoint: getLocalControlEndpoint(dataDir).path,
+    logPath: getDaemonLogPath(dataDir),
+    topics: transport.getJoinedTopics(),
+    connectedPeers: [...transport.getPeerSessions().values()],
+    healthy: true
+  };
+}
+
+async function runProtocolDiscoveryWatcher(
+  transport: AgentTransport,
+  seenControlLengths: Map<string, number>,
+  io: CliIo
+): Promise<void> {
+  for (const session of transport.getPeerSessions().values()) {
+    const remoteFeed = transport.getRemoteFeed(session.remoteControlFeedKey);
+    if (!remoteFeed) {
+      continue;
+    }
+    await remoteFeed.update({ wait: false });
+    const seenLength = seenControlLengths.get(session.remoteControlFeedKey) ?? 0;
+    if (remoteFeed.length <= seenLength) {
+      continue;
+    }
+    for (let index = seenLength; index < remoteFeed.length; index += 1) {
+      const entry = await remoteFeed.get(index);
+      if (Protocol.isProtocolAnnouncement(entry)) {
+        io.stdout(`${JSON.stringify({ command: "daemon.discovery", remoteDid: session.remoteDid, announcement: entry })}\n`);
+      }
+    }
+    seenControlLengths.set(session.remoteControlFeedKey, remoteFeed.length);
+  }
+}
+
+async function waitForProcessSignal(): Promise<void> {
+  await Promise.race([
+    once(process, "SIGINT").then(() => undefined),
+    once(process, "SIGTERM").then(() => undefined)
+  ]);
+}
+
+async function handleDaemonRun(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const transport = await AgentTransport.create(buildTransportConfigFromArgs(args));
+  const startup = getDaemonStartupOptions(args);
+  let sharedContext: CliContext | undefined;
+  let daemon: AgentDaemon | undefined;
+  let discoveryInterval: NodeJS.Timeout | undefined;
+  const seenControlLengths = new Map<string, number>();
+  const startedAt = new Date().toISOString();
+
+  try {
+    await transport.start();
+    sharedContext = await buildDaemonSharedContext(dataDir, transport);
+
+    const topics = buildTopicsFromArgs(args, transport.identity.did);
+    startup.topics.push(...topics);
+    for (const topic of startup.topics) {
+      await transport.joinTopic(topic);
+    }
+    for (const did of startup.connectDids) {
+      await transport.connectToDid(did);
+    }
+    for (const publicKey of startup.connectNoiseKeys) {
+      await transport.connectToNoiseKey(publicKey);
+    }
+
+    if (startup.watchProtocol) {
+      discoveryInterval = setInterval(() => {
+        void runProtocolDiscoveryWatcher(transport, seenControlLengths, io).catch((error: unknown) => {
+          io.stderr(`${error instanceof Error ? error.message : String(error)}\n`);
+        });
+      }, 2_000);
+    }
+
+    daemon = new AgentDaemon({
+      dataDir,
+      statusProvider: () => buildDaemonStatus(dataDir, startedAt, transport),
+      commandHandler: async (request: DaemonCommandRequest) => {
+        if (!sharedContext) {
+          throw new Error("Daemon context is not available");
+        }
+        return CLI_CONTEXT_STORAGE.run(sharedContext, async () =>
+          executeCapturedInDaemon({
+            commandPath: request.commandPath,
+            options: daemonOptionsRecordToMap(request.options)
+          })
+        );
+      },
+      onShutdown: async () => {
+        if (discoveryInterval) {
+          clearInterval(discoveryInterval);
+          discoveryInterval = undefined;
+        }
+        if (sharedContext) {
+          await sharedContext.repository.close();
+          sharedContext = undefined;
+        }
+        await transport.stop();
+      }
+    });
+
+    await daemon.start();
+    io.stdout(`${JSON.stringify({ command: "daemon.run", pid: process.pid, endpoint: getLocalControlEndpoint(dataDir).path })}\n`);
+    await Promise.race([daemon.waitForShutdown(), waitForProcessSignal()]);
+  } finally {
+    if (daemon) {
+      await daemon.stop();
+    } else {
+      if (discoveryInterval) {
+        clearInterval(discoveryInterval);
+      }
+      if (sharedContext) {
+        await sharedContext.repository.close();
+      }
+      await transport.stop();
+    }
+  }
+}
+
+async function executeParsedArgs(args: ParsedArgs, io: CliIo, options: DispatchOptions): Promise<number> {
+  if (args.commandPath.length === 0 || hasFlag(args, "help")) {
+    io.stdout(`${usage()}\n`);
+    return 0;
+  }
+
+  if (commandMatches(args.commandPath, "daemon", "start")) return await handleDaemonStart(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "daemon", "status")) return await handleDaemonStatus(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "daemon", "stop")) return await handleDaemonStop(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "daemon", "logs")) return await handleDaemonLogs(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "daemon", "run")) return await handleDaemonRun(args, io).then(() => 0);
+
+  if (options.allowDaemonProxy) {
+    const dataDir = getDataDirFromArgs(args);
+    if (dataDir) {
+      const activeDaemon = await probeDaemonStatus(dataDir, 1_000);
+      if (activeDaemon) {
+        return proxyParsedArgsToDaemon(args, io);
+      }
+    }
+  }
+
+  if (commandMatches(args.commandPath, "agent", "init")) return await handleAgentInit(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "agent", "show")) return await handleAgentShow(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "agent", "payment-endpoint", "add")) return await handleAgentPaymentEndpointAdd(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "agent", "payment-endpoint", "remove")) return await handleAgentPaymentEndpointRemove(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "agent", "wallet-attestation", "add")) return await handleAgentWalletAttestationAdd(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "agent", "wallet-attestation", "remove")) return await handleAgentWalletAttestationRemove(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "agent", "feedback", "add")) return await handleAgentFeedbackAdd(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "agent", "feedback", "remove")) return await handleAgentFeedbackRemove(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "company", "create")) return await handleCompanyCreate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "company", "show")) return await handleCompanyShow(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "company", "update")) return await handleCompanyUpdate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "company", "grant-role")) return await handleCompanyRoleChange(args, io, "grant").then(() => 0);
+  if (commandMatches(args.commandPath, "company", "revoke-role")) return await handleCompanyRoleChange(args, io, "revoke").then(() => 0);
+  if (commandMatches(args.commandPath, "company", "join-market")) return await handleCompanyMarketMembership(args, io, "join").then(() => 0);
+  if (commandMatches(args.commandPath, "company", "leave-market")) return await handleCompanyMarketMembership(args, io, "leave").then(() => 0);
+  if (commandMatches(args.commandPath, "company", "treasury-attest")) return await handleCompanyTreasuryAttest(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "company", "treasury-reserve")) return await handleCompanyTreasuryReserve(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "company", "treasury-release")) return await handleCompanyTreasuryRelease(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "product", "create")) return await handleMarketProductCreate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "product", "update")) return await handleMarketProductUpdate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "product", "publish")) return await handleMarketProductStateChange(args, io, "product.published").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "product", "unpublish")) return await handleMarketProductStateChange(args, io, "product.unpublished").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "product", "retire")) return await handleMarketProductStateChange(args, io, "product.retired").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "listing", "publish")) return await handleMarketListingPublish(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "listing", "revise")) return await handleMarketListingRevise(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "listing", "withdraw")) return await handleSimpleMarketStateChange(args, io, "listing", "listing.withdrawn").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "listing", "expire")) return await handleSimpleMarketStateChange(args, io, "listing", "listing.expired").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "request", "publish")) return await handleMarketRequestPublish(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "request", "revise")) return await handleMarketRequestRevise(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "request", "close")) return await handleSimpleMarketStateChange(args, io, "request", "request.closed").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "request", "expire")) return await handleSimpleMarketStateChange(args, io, "request", "request.expired").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "offer", "submit")) return await handleMarketOfferSubmit(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "offer", "counter")) return await handleMarketOfferCounter(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "offer", "accept")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.accepted").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "offer", "reject")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.rejected").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "offer", "cancel")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.canceled").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "offer", "expire")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.expired").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "bid", "submit")) return await handleMarketBidSubmit(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "bid", "counter")) return await handleMarketBidCounter(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "bid", "accept")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.accepted").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "bid", "reject")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.rejected").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "bid", "cancel")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.canceled").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "bid", "expire")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.expired").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "agreement", "create")) return await handleMarketAgreementCreate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "market", "agreement", "complete")) return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.completed").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "agreement", "cancel")) return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.canceled").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "agreement", "dispute")) return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.disputed").then(() => 0);
+  if (commandMatches(args.commandPath, "market", "list")) return await handleMarketList(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "create")) return await handleContractCreate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "open-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-opened").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "submit-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-submitted").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "accept-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-accepted").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "reject-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-rejected").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "pause")) return await handleContractStateChange(args, io, "contract.paused").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "resume")) return await handleContractStateChange(args, io, "contract.resumed").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "complete")) return await handleContractStateChange(args, io, "contract.completed").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "cancel")) return await handleContractStateChange(args, io, "contract.canceled").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "dispute")) return await handleContractStateChange(args, io, "contract.disputed").then(() => 0);
+  if (commandMatches(args.commandPath, "contract", "entries")) return await handleContractEntries(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "evidence", "record")) return await handleEvidenceRecord(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "oracle", "attest")) return await handleOracleAttest(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "dispute", "open")) return await handleDisputeOpen(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "dispute", "add-evidence")) return await handleDisputeAddEvidence(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "dispute", "request-oracle")) return await handleDisputeRequestOracle(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "dispute", "rule")) return await handleDisputeRule(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "dispute", "close")) return await handleDisputeClose(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "space", "create")) return await handleSpaceCreate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "space", "add-member")) return await handleSpaceMembershipAction(args, io, "space-membership.member-added").then(() => 0);
+  if (commandMatches(args.commandPath, "space", "remove-member")) return await handleSpaceMembershipAction(args, io, "space-membership.member-removed").then(() => 0);
+  if (commandMatches(args.commandPath, "space", "mute-member")) return await handleSpaceMembershipAction(args, io, "space-membership.member-muted").then(() => 0);
+  if (commandMatches(args.commandPath, "space", "set-role")) return await handleSpaceMembershipAction(args, io, "space-membership.member-role-updated").then(() => 0);
+  if (commandMatches(args.commandPath, "space", "entries")) return await handleSpaceEntries(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "message", "send")) return await handleMessageSend(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "message", "edit")) return await handleMessageEdit(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "message", "delete")) return await handleMessageDelete(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "message", "react")) return await handleMessageReact(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "object", "show")) return await handleObjectShow(args, io).then(() => 0);
+  throw new Error(`Unknown command: ${args.commandPath.join(" ")}`);
 }
 
 export async function runCli(argv: string[], io: CliIo = DEFAULT_IO): Promise<number> {
   try {
     const args = parseArgs(argv);
-    if (args.commandPath.length === 0 || hasFlag(args, "help")) {
-      io.stdout(`${usage()}\n`);
-      return 0;
-    }
-
-    if (commandMatches(args.commandPath, "agent", "init")) return await handleAgentInit(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "agent", "show")) return await handleAgentShow(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "agent", "payment-endpoint", "add")) {
-      return await handleAgentPaymentEndpointAdd(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "agent", "payment-endpoint", "remove")) {
-      return await handleAgentPaymentEndpointRemove(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "agent", "wallet-attestation", "add")) {
-      return await handleAgentWalletAttestationAdd(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "agent", "wallet-attestation", "remove")) {
-      return await handleAgentWalletAttestationRemove(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "agent", "feedback", "add")) {
-      return await handleAgentFeedbackAdd(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "agent", "feedback", "remove")) {
-      return await handleAgentFeedbackRemove(args, io).then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "company", "create")) return await handleCompanyCreate(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "company", "show")) return await handleCompanyShow(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "company", "update")) return await handleCompanyUpdate(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "company", "grant-role")) {
-      return await handleCompanyRoleChange(args, io, "grant").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "company", "revoke-role")) {
-      return await handleCompanyRoleChange(args, io, "revoke").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "company", "join-market")) {
-      return await handleCompanyMarketMembership(args, io, "join").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "company", "leave-market")) {
-      return await handleCompanyMarketMembership(args, io, "leave").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "company", "treasury-attest")) {
-      return await handleCompanyTreasuryAttest(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "company", "treasury-reserve")) {
-      return await handleCompanyTreasuryReserve(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "company", "treasury-release")) {
-      return await handleCompanyTreasuryRelease(args, io).then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "market", "product", "create")) {
-      return await handleMarketProductCreate(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "product", "update")) {
-      return await handleMarketProductUpdate(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "product", "publish")) {
-      return await handleMarketProductStateChange(args, io, "product.published").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "product", "unpublish")) {
-      return await handleMarketProductStateChange(args, io, "product.unpublished").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "product", "retire")) {
-      return await handleMarketProductStateChange(args, io, "product.retired").then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "market", "listing", "publish")) {
-      return await handleMarketListingPublish(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "listing", "revise")) {
-      return await handleMarketListingRevise(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "listing", "withdraw")) {
-      return await handleSimpleMarketStateChange(args, io, "listing", "listing.withdrawn").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "listing", "expire")) {
-      return await handleSimpleMarketStateChange(args, io, "listing", "listing.expired").then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "market", "request", "publish")) {
-      return await handleMarketRequestPublish(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "request", "revise")) {
-      return await handleMarketRequestRevise(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "request", "close")) {
-      return await handleSimpleMarketStateChange(args, io, "request", "request.closed").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "request", "expire")) {
-      return await handleSimpleMarketStateChange(args, io, "request", "request.expired").then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "market", "offer", "submit")) {
-      return await handleMarketOfferSubmit(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "offer", "counter")) {
-      return await handleMarketOfferCounter(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "offer", "accept")) {
-      return await handleSimpleMarketStateChange(args, io, "offer", "offer.accepted").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "offer", "reject")) {
-      return await handleSimpleMarketStateChange(args, io, "offer", "offer.rejected").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "offer", "cancel")) {
-      return await handleSimpleMarketStateChange(args, io, "offer", "offer.canceled").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "offer", "expire")) {
-      return await handleSimpleMarketStateChange(args, io, "offer", "offer.expired").then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "market", "bid", "submit")) {
-      return await handleMarketBidSubmit(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "bid", "counter")) {
-      return await handleMarketBidCounter(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "bid", "accept")) {
-      return await handleSimpleMarketStateChange(args, io, "bid", "bid.accepted").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "bid", "reject")) {
-      return await handleSimpleMarketStateChange(args, io, "bid", "bid.rejected").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "bid", "cancel")) {
-      return await handleSimpleMarketStateChange(args, io, "bid", "bid.canceled").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "bid", "expire")) {
-      return await handleSimpleMarketStateChange(args, io, "bid", "bid.expired").then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "market", "agreement", "create")) {
-      return await handleMarketAgreementCreate(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "agreement", "complete")) {
-      return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.completed").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "agreement", "cancel")) {
-      return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.canceled").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "market", "agreement", "dispute")) {
-      return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.disputed").then(() => 0);
-    }
-
-    if (commandMatches(args.commandPath, "market", "list")) return await handleMarketList(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "contract", "create")) return await handleContractCreate(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "contract", "open-milestone")) {
-      return await handleContractMilestoneAction(args, io, "contract.milestone-opened").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "submit-milestone")) {
-      return await handleContractMilestoneAction(args, io, "contract.milestone-submitted").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "accept-milestone")) {
-      return await handleContractMilestoneAction(args, io, "contract.milestone-accepted").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "reject-milestone")) {
-      return await handleContractMilestoneAction(args, io, "contract.milestone-rejected").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "pause")) {
-      return await handleContractStateChange(args, io, "contract.paused").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "resume")) {
-      return await handleContractStateChange(args, io, "contract.resumed").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "complete")) {
-      return await handleContractStateChange(args, io, "contract.completed").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "cancel")) {
-      return await handleContractStateChange(args, io, "contract.canceled").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "dispute")) {
-      return await handleContractStateChange(args, io, "contract.disputed").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "contract", "entries")) {
-      return await handleContractEntries(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "evidence", "record")) return await handleEvidenceRecord(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "oracle", "attest")) return await handleOracleAttest(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "dispute", "open")) return await handleDisputeOpen(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "dispute", "add-evidence")) {
-      return await handleDisputeAddEvidence(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "dispute", "request-oracle")) {
-      return await handleDisputeRequestOracle(args, io).then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "dispute", "rule")) return await handleDisputeRule(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "dispute", "close")) return await handleDisputeClose(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "space", "create")) return await handleSpaceCreate(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "space", "add-member")) {
-      return await handleSpaceMembershipAction(args, io, "space-membership.member-added").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "space", "remove-member")) {
-      return await handleSpaceMembershipAction(args, io, "space-membership.member-removed").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "space", "mute-member")) {
-      return await handleSpaceMembershipAction(args, io, "space-membership.member-muted").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "space", "set-role")) {
-      return await handleSpaceMembershipAction(args, io, "space-membership.member-role-updated").then(() => 0);
-    }
-    if (commandMatches(args.commandPath, "space", "entries")) return await handleSpaceEntries(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "message", "send")) return await handleMessageSend(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "message", "edit")) return await handleMessageEdit(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "message", "delete")) return await handleMessageDelete(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "message", "react")) return await handleMessageReact(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "object", "show")) return await handleObjectShow(args, io).then(() => 0);
-    if (commandMatches(args.commandPath, "serve")) return await handleServe(args, io).then(() => 0);
-
-    throw new Error(`Unknown command: ${args.commandPath.join(" ")}`);
+    return await executeParsedArgs(args, io, { allowDaemonProxy: true });
   } catch (error) {
     io.stderr(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
 }
 
-const executedPath = process.argv[1] ? new URL(`file://${process.argv[1]}`).href : "";
+const executedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
 if (import.meta.url === executedPath) {
   void runCli(process.argv.slice(2)).then((exitCode) => {
     process.exitCode = exitCode;

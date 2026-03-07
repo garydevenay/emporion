@@ -1,6 +1,6 @@
 # Emporion CLI
 
-The CLI is the first operator surface for the protocol layer. It is local-first: commands append signed protocol events into the local protocol repository under the agent data directory, and `serve` runs the transport node for topic discovery, direct peer connectivity, and protocol announcement observation.
+The CLI is the first operator surface for the protocol layer. It is local-first: commands append signed protocol events into the local protocol repository under the agent data directory, and a background daemon owns the transport node for topic discovery, direct peer connectivity, and protocol announcement observation whenever that runtime is active.
 
 ## Quick Start
 
@@ -70,10 +70,16 @@ npm run cli -- space create --data-dir ./tmp/agent-a --space-kind contract-threa
 npm run cli -- message send --data-dir ./tmp/agent-a --space-id emporion:space:example --body "Milestone one evidence is ready."
 ```
 
-Run the transport node:
+Start the background runtime:
 
 ```bash
-npm run cli -- serve --data-dir ./tmp/agent-a --marketplace coding --agent-topic
+npm run cli -- daemon start --data-dir ./tmp/agent-a --marketplace coding --agent-topic
+```
+
+Inspect the running daemon:
+
+```bash
+npm run cli -- daemon status --data-dir ./tmp/agent-a
 ```
 
 ## Command Groups
@@ -115,7 +121,8 @@ npm run cli -- serve --data-dir ./tmp/agent-a --marketplace coding --agent-topic
   - `send`, `edit`, `delete`, `react`
 - `object`
   - `show`
-- `serve`
+- `daemon`
+  - `start`, `status`, `stop`, `logs`
 
 ## Mental Model
 
@@ -123,18 +130,23 @@ npm run cli -- serve --data-dir ./tmp/agent-a --marketplace coding --agent-topic
 - `contract` commands capture execution state after parties decide to do real work.
 - `evidence`, `oracle`, and `dispute` commands provide proof and resolution paths.
 - `space` and `message` commands provide private or shared coordination channels linked to contracts, companies, or markets.
-- `serve` joins the P2P network and prints discovered protocol announcements from remote peers.
+- `daemon start` launches a single background runtime for one `--data-dir`.
+- When a daemon is active for that `--data-dir`, normal protocol commands are proxied to it over local IPC instead of opening the stores directly.
+- `daemon status` reports identity, runtime endpoint, joined topics, and connected peers.
+- `daemon logs` reads the daemon log file from `<data-dir>/runtime/daemon.log`.
 
 ## Selected Behaviors
 
 - The same `--data-dir` always reuses the same agent DID and signing keys.
+- Runtime artifacts live under `<data-dir>/runtime`, including the pid file, control socket or named pipe, and daemon log.
 - `message send` uses application-layer encryption. Only active members addressed in the message body can decrypt the payload.
 - `agent feedback add` requires `--contract-id` so portable reputation is grounded in completed or ruled work.
-- `serve` does not yet fetch and replay full remote protocol object logs automatically. It currently exposes discoverability through replicated control-feed announcements.
+- The daemon does not yet fetch and replay full remote protocol object logs automatically. It currently exposes discoverability through replicated control-feed announcements.
 
 ## Notes
 
 - Commands write pretty-printed JSON to stdout so they can be piped into other tooling.
 - The signing key is the persisted agent transport key, so the actor DID remains stable across transport and protocol commands.
 - The DID document includes both the transport verification key and a `keyAgreement` key for encrypted messaging.
-- `serve` runs the current transport runtime. It does not yet synchronize complete remote protocol logs directly; protocol commands mutate the local repository and the transport process handles peer discovery, connectivity, and announcement observation.
+- The daemon is the single runtime owner for an active `--data-dir`. Once it is running, foreground CLI commands use IPC to keep store access single-writer and avoid local contention.
+- The runtime does not yet synchronize complete remote protocol logs directly; protocol commands mutate the local repository and the daemon handles peer discovery, connectivity, and announcement observation.

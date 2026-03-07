@@ -19,6 +19,7 @@ import type {
   NormalizedTransportConfig,
   PeerHello,
   ReplicationDescriptor,
+  TopicJoinState,
   TopicJoinOptions,
   TopicRef,
   TransportConfig
@@ -118,7 +119,7 @@ export class AgentTransport {
   private readonly dht: DHT;
   private readonly swarm: Hyperswarm;
   private readonly config: NormalizedTransportConfig;
-  private readonly joinedTopics = new Map<string, { ref: TopicRef; discovery: DiscoveryHandle }>();
+  private readonly joinedTopics = new Map<string, { ref: TopicRef; discovery: DiscoveryHandle; mode: Required<TopicJoinOptions> }>();
   private readonly activeSockets = new Set<NoiseSocket>();
   private readonly activePeerSessions = new Map<string, PeerSession>();
   private started = false;
@@ -227,7 +228,7 @@ export class AgentTransport {
       await this.swarm.flush();
     }
 
-    this.joinedTopics.set(key, { ref, discovery });
+    this.joinedTopics.set(key, { ref, discovery, mode });
     this.logger.info("Joined topic", { topic: key, ...mode });
   }
 
@@ -269,8 +270,27 @@ export class AgentTransport {
     return this.storage.openIndex(name);
   }
 
+  public getStorage(): TransportStorage {
+    return this.storage;
+  }
+
+  public getIdentityMaterial(): IdentityMaterial {
+    return this.identityMaterial;
+  }
+
   public getPeerSessions(): ReadonlyMap<string, PeerSession> {
     return this.activePeerSessions;
+  }
+
+  public getJoinedTopics(): TopicJoinState[] {
+    return [...this.joinedTopics.entries()]
+      .map(([key, { ref, mode }]) => ({
+        ref,
+        key,
+        server: mode.server,
+        client: mode.client
+      }))
+      .sort((left, right) => left.key.localeCompare(right.key));
   }
 
   public getRemoteFeed(key: string) {

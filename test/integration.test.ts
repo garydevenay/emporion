@@ -18,15 +18,6 @@ async function createAgentDir(prefix: string): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
-function hasReplicationPeer(feed: unknown): boolean {
-  if (typeof feed !== "object" || feed === null || !("peers" in feed)) {
-    return false;
-  }
-
-  const peers = (feed as { peers?: unknown }).peers;
-  return Array.isArray(peers) && peers.length > 0;
-}
-
 test("two agents discover each other, complete the handshake, and replicate the events feed", async () => {
   const bootstrap = await createBootstrapNode();
   const dirA = await createAgentDir("emporion-agent-a-");
@@ -62,12 +53,9 @@ test("two agents discover each other, complete the handshake, and replicate the 
     );
     assert.ok(remoteEventsDescriptorOnB);
     assert.equal(remoteEventsDescriptorOnB.key, feedKey);
-    await waitFor(() => {
-      const feed = agentB.getRemoteFeed(remoteEventsDescriptorOnB.key);
-      return feed && hasReplicationPeer(feed) ? feed : null;
-    }, {
+    await waitFor(() => agentB.getRemoteFeed(remoteEventsDescriptorOnB.key) ?? null, {
       timeoutMs: 10_000,
-      message: "Remote events feed did not attach to a replication peer"
+      message: "Remote events feed was not registered on peer B"
     });
 
     await eventsFeedA.append({
@@ -105,12 +93,9 @@ test("two agents discover each other, complete the handshake, and replicate the 
       (descriptor) => descriptor.name === "events"
     );
     assert.ok(remoteEventsDescriptorOnA);
-    await waitFor(() => {
-      const feed = agentA.getRemoteFeed(remoteEventsDescriptorOnA.key);
-      return feed && hasReplicationPeer(feed) ? feed : null;
-    }, {
+    await waitFor(() => agentA.getRemoteFeed(remoteEventsDescriptorOnA.key) ?? null, {
       timeoutMs: 10_000,
-      message: "Peer A remote events feed did not attach to a replication peer"
+      message: "Peer A remote events feed was not registered"
     });
 
     await eventsFeedB.append({

@@ -1,8 +1,16 @@
 import { duplexPair } from "node:stream";
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 
 import { normalizeTransportConfig } from "../src/config.js";
+import {
+  daemonOptionsRecordToMap,
+  daemonRequestOptionsToRecord,
+  getDaemonLogPath,
+  getDaemonPidPath,
+  getLocalControlEndpoint
+} from "../src/daemon.js";
 import { createPeerDid, extractEmporionTransportService, resolveDidDocument } from "../src/did.js";
 import { loadIdentityMaterial } from "../src/identity.js";
 import { performPeerHandshake } from "../src/handshake.js";
@@ -98,4 +106,32 @@ test("performPeerHandshake times out when the remote peer stays silent", async (
   };
 
   await assert.rejects(() => performPeerHandshake(left, hello, 50), /timed out/i);
+});
+
+test("daemon endpoint helpers resolve runtime paths deterministically", () => {
+  const dataDir = path.join(process.cwd(), "tmp", "daemon-endpoint-test");
+  const endpoint = getLocalControlEndpoint(dataDir);
+
+  assert.equal(getDaemonPidPath(dataDir).endsWith(path.join("runtime", "daemon.pid")), true);
+  assert.equal(getDaemonLogPath(dataDir).endsWith(path.join("runtime", "daemon.log")), true);
+  if (process.platform === "win32") {
+    assert.equal(endpoint.kind, "named-pipe");
+    assert.equal(endpoint.path.startsWith("\\\\.\\pipe\\emporion-"), true);
+  } else {
+    assert.equal(endpoint.kind, "unix");
+    assert.equal(endpoint.path.endsWith(path.join("runtime", "daemon.sock")), true);
+  }
+});
+
+test("daemon request option records round-trip without mutation", () => {
+  const original = new Map<string, string[]>([
+    ["data-dir", ["./tmp/agent-a"]],
+    ["marketplace", ["coding", "shipping"]],
+    ["agent-topic", ["true"]]
+  ]);
+
+  const record = daemonRequestOptionsToRecord(original);
+  const restored = daemonOptionsRecordToMap(record);
+
+  assert.deepEqual([...restored.entries()], [...original.entries()]);
 });
