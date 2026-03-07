@@ -2,6 +2,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { closeSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -33,6 +34,8 @@ import type { IdentityMaterial } from "./identity.js";
 import { TransportStorage } from "./storage.js";
 import type { TopicRef, TransportConfig } from "./types.js";
 import { WalletService, type AutoSettleCandidate } from "./wallet/index.js";
+import { ContextStore } from "./context-store.js";
+import { DealsStore, type DealRecord, type DealStage } from "./experience/deals-store.js";
 
 interface CliIo {
   stdout(message: string): void;
@@ -108,6 +111,10 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 function commandMatches(commandPath: string[], ...expected: string[]): boolean {
   return commandPath.length === expected.length && expected.every((value, index) => commandPath[index] === value);
+}
+
+function isContextCommand(commandPath: string[]): boolean {
+  return commandPath[0] === "context";
 }
 
 function isWalletCommand(commandPath: string[]): boolean {
@@ -304,6 +311,158 @@ function normalizeDataDirPath(dataDir: string): string {
   return path.resolve(dataDir);
 }
 
+function parsedArgsFromCommand(
+  commandPath: string[],
+  options: Record<string, string | string[] | boolean | undefined>
+): ParsedArgs {
+  const map = new Map<string, string[]>();
+  for (const [name, value] of Object.entries(options)) {
+    if (value === undefined) {
+      continue;
+    }
+    if (typeof value === "boolean") {
+      if (value) {
+        map.set(name, ["true"]);
+      }
+      continue;
+    }
+    if (Array.isArray(value)) {
+      map.set(name, value.map((entry) => `${entry}`));
+      continue;
+    }
+    map.set(name, [`${value}`]);
+  }
+  return {
+    commandPath: [...commandPath],
+    options: map
+  };
+}
+
+async function runNestedCommand(commandPath: string[], options: Record<string, string | string[] | boolean | undefined>): Promise<unknown> {
+  return executeCapturedInDaemon(parsedArgsFromCommand(commandPath, options));
+}
+
+function ensureObjectIdPrefix(objectId: string, prefixes: string[]): string {
+  const trimmed = objectId.trim();
+  if (!prefixes.some((prefix) => trimmed.startsWith(prefix))) {
+    throw new Error(`Unsupported object id: ${trimmed}`);
+  }
+  return trimmed;
+}
+
+function stageOrder(stage: DealStage): number {
+  switch (stage) {
+    case "draft":
+      return 0;
+    case "negotiating":
+      return 1;
+    case "agreed":
+      return 2;
+    case "in_progress":
+      return 3;
+    case "proof_submitted":
+      return 4;
+    case "proof_accepted":
+      return 5;
+    case "settlement_pending":
+      return 6;
+    case "settled":
+      return 7;
+    case "closed":
+      return 8;
+  }
+}
+
+function stageAtLeast(current: DealStage, expected: DealStage): boolean {
+  return stageOrder(current) >= stageOrder(expected);
+}
+
+function toChangedObjects(record: DealRecord): Array<{ kind: string; id: string }> {
+  const entries: Array<{ kind: string; id: string }> = [];
+  if (record.rootObjectKind && record.rootObjectId) entries.push({ kind: record.rootObjectKind, id: record.rootObjectId });
+  if (record.proposalKind && record.proposalId) entries.push({ kind: record.proposalKind, id: record.proposalId });
+  if (record.agreementId) entries.push({ kind: "agreement", id: record.agreementId });
+  if (record.contractId) entries.push({ kind: "contract", id: record.contractId });
+  if (record.evidenceId) entries.push({ kind: "evidence-bundle", id: record.evidenceId });
+  if (record.invoiceId) entries.push({ kind: "invoice", id: record.invoiceId });
+  if (record.paymentId) entries.push({ kind: "payment", id: record.paymentId });
+  return entries;
+}
+
+function nextActionsForStage(stage: DealStage): string[] {
+  switch (stage) {
+    case "draft":
+    case "negotiating":
+      return ["deal.propose", "deal.accept"];
+    case "agreed":
+      return ["deal.start"];
+    case "in_progress":
+      return ["proof.submit"];
+    case "proof_submitted":
+      return ["proof.accept"];
+    case "proof_accepted":
+      return ["settlement.invoice.create", "settlement.pay"];
+    case "settlement_pending":
+      return ["settlement.pay", "settlement.status"];
+    case "settled":
+      return ["deal.status"];
+    case "closed":
+      return [];
+  }
+}
+
+function writeDealResponse(io: CliIo, command: string, deal: DealRecord, overrides?: { safety?: { earlySettlementAllowed: boolean } }): void {
+  writeJson(io, {
+    command,
+    dealId: deal.dealId,
+    stage: deal.stage,
+    changedObjects: toChangedObjects(deal),
+    nextActions: nextActionsForStage(deal.stage),
+    safety: {
+      policy: "proof-gated",
+      earlySettlementAllowed: overrides?.safety?.earlySettlementAllowed ?? false
+    }
+  });
+}
+
+function asRecord(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`Expected ${label} to be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function readString(value: unknown, fieldName: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Expected ${fieldName} to be a non-empty string`);
+  }
+  return value;
+}
+
+function inferIntentFromRootObjectKind(kind: "request" | "listing"): "buy" | "sell" {
+  return kind === "request" ? "sell" : "buy";
+}
+
+function inferRootObjectKindFromId(objectId: string): "request" | "listing" {
+  if (objectId.startsWith("emporion:request:")) {
+    return "request";
+  }
+  if (objectId.startsWith("emporion:listing:")) {
+    return "listing";
+  }
+  throw new Error(`Unsupported target object id for proposal: ${objectId}`);
+}
+
+function inferProposalKindFromId(proposalId: string): "offer" | "bid" {
+  if (proposalId.startsWith("emporion:offer:")) {
+    return "offer";
+  }
+  if (proposalId.startsWith("emporion:bid:")) {
+    return "bid";
+  }
+  throw new Error(`Unsupported proposal id: ${proposalId}`);
+}
+
 async function openCliContext(dataDir: string): Promise<CliContext> {
   const identityMaterial = await loadPersistentIdentityMaterial(dataDir);
   const repository = await Protocol.ProtocolRepository.create(dataDir);
@@ -342,7 +501,7 @@ async function withCliContext<T>(dataDir: string, fn: (context: CliContext) => P
 
   const context = await openCliContext(dataDir);
   try {
-    return await fn(context);
+    return await CLI_CONTEXT_STORAGE.run(context, async () => fn(context));
   } finally {
     await closeCliContext(context);
   }
@@ -2124,6 +2283,64 @@ async function handleMarketList(args: ParsedArgs, io: CliIo): Promise<void> {
   });
 }
 
+async function handleContextAdd(args: ParsedArgs, io: CliIo): Promise<void> {
+  const name = requireOption(args, "name");
+  const dataDir = requireOption(args, "data-dir");
+  const makeActive = hasFlag(args, "make-active");
+  const store = new ContextStore();
+  const snapshot = await store.add(name, dataDir, makeActive);
+  writeJson(io, {
+    command: "context.add",
+    activeContext: snapshot.activeContext,
+    contexts: snapshot.contexts
+  });
+}
+
+async function handleContextUse(args: ParsedArgs, io: CliIo): Promise<void> {
+  const name = requireOption(args, "name");
+  const store = new ContextStore();
+  const snapshot = await store.use(name);
+  writeJson(io, {
+    command: "context.use",
+    activeContext: snapshot.activeContext,
+    contexts: snapshot.contexts
+  });
+}
+
+async function handleContextList(io: CliIo): Promise<void> {
+  const store = new ContextStore();
+  const snapshot = await store.snapshot();
+  writeJson(io, {
+    command: "context.list",
+    activeContext: snapshot.activeContext,
+    contexts: snapshot.contexts
+  });
+}
+
+async function handleContextShow(io: CliIo): Promise<void> {
+  const store = new ContextStore();
+  const snapshot = await store.snapshot();
+  const active = snapshot.activeContext
+    ? snapshot.contexts.find((entry) => entry.name === snapshot.activeContext)
+    : undefined;
+  writeJson(io, {
+    command: "context.show",
+    activeContext: snapshot.activeContext,
+    active: active ?? null
+  });
+}
+
+async function handleContextRemove(args: ParsedArgs, io: CliIo): Promise<void> {
+  const name = requireOption(args, "name");
+  const store = new ContextStore();
+  const snapshot = await store.remove(name);
+  writeJson(io, {
+    command: "context.remove",
+    activeContext: snapshot.activeContext,
+    contexts: snapshot.contexts
+  });
+}
+
 function applyWalletRuntimeKeyFromArgs(context: CliContext, args: ParsedArgs): void {
   const walletKey = getOptionalOption(args, "wallet-key");
   if (walletKey && walletKey.trim().length > 0) {
@@ -2192,6 +2409,39 @@ async function handleWalletStatus(args: ParsedArgs, io: CliIo): Promise<void> {
     applyWalletRuntimeKeyFromArgs(context, args);
     writeJson(io, {
       command: "wallet.status",
+      wallet: await context.walletService.status()
+    });
+  });
+}
+
+async function handleWalletUnlock(args: ParsedArgs, io: CliIo): Promise<void> {
+  if (process.env.EMPORION_DAEMON !== "1") {
+    throw new Error("wallet unlock requires a running daemon for this data-dir");
+  }
+  const dataDir = requireOption(args, "data-dir");
+  const walletKey = requireOption(args, "wallet-key");
+  if (walletKey.trim().length === 0) {
+    throw new Error("--wallet-key must not be blank");
+  }
+
+  await withCliContext(dataDir, async (context) => {
+    context.walletService.setRuntimeKey(walletKey);
+    writeJson(io, {
+      command: "wallet.unlock",
+      wallet: await context.walletService.status()
+    });
+  });
+}
+
+async function handleWalletLock(args: ParsedArgs, io: CliIo): Promise<void> {
+  if (process.env.EMPORION_DAEMON !== "1") {
+    throw new Error("wallet lock requires a running daemon for this data-dir");
+  }
+  const dataDir = requireOption(args, "data-dir");
+  await withCliContext(dataDir, async (context) => {
+    context.walletService.setRuntimeKey(null);
+    writeJson(io, {
+      command: "wallet.lock",
       wallet: await context.walletService.status()
     });
   });
@@ -2271,18 +2521,491 @@ async function handleWalletKeyRotate(args: ParsedArgs, io: CliIo): Promise<void>
   });
 }
 
+async function handleDealOpen(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const intent = parseEnum(requireOption(args, "intent"), "--intent", ["buy", "sell"] as const);
+  const marketplaceId = requireOption(args, "marketplace");
+  const title = requireOption(args, "title");
+  const amountSats = parsePositiveInteger(requireOption(args, "amount-sats"), "--amount-sats");
+  const dealId = getOptionalOption(args, "deal-id") ?? `deal:${randomUUID()}`;
+
+  await withCliContext(dataDir, async () => {
+    const deals = await DealsStore.create(dataDir);
+    if (deals.get(dealId)) {
+      throw new Error(`Deal already exists: ${dealId}`);
+    }
+
+    const created = await runNestedCommand(
+      ["market", intent === "buy" ? "request" : "listing", "publish"],
+      {
+        "data-dir": dataDir,
+        marketplace: marketplaceId,
+        title,
+        "amount-sats": `${amountSats}`
+      }
+    );
+    const createdRecord = asRecord(created, `${intent}.publish result`);
+    const objectId = readString(createdRecord.objectId, "objectId");
+
+    const nowIso = now();
+    const deal: DealRecord = {
+      dealId,
+      stage: "negotiating",
+      intent,
+      marketplaceId,
+      title,
+      amountSats,
+      rootObjectKind: intent === "buy" ? "request" : "listing",
+      rootObjectId: objectId,
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+    await deals.save(deal);
+    writeDealResponse(io, "deal.open", deal);
+  });
+}
+
+async function handleDealPropose(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const targetId = requireOption(args, "target-id");
+  const amountSats = parsePositiveInteger(requireOption(args, "amount-sats"), "--amount-sats");
+  const proposalId = getOptionalOption(args, "proposal-id");
+  const proposerDid = getOptionalOption(args, "proposer-did");
+
+  await withCliContext(dataDir, async (context) => {
+    const rootObjectKind = inferRootObjectKindFromId(targetId);
+    const deals = await DealsStore.create(dataDir);
+    const targetState =
+      rootObjectKind === "request"
+        ? await readRequiredState<Protocol.RequestState>(context.repository, "request", targetId)
+        : await readRequiredState<Protocol.ListingState>(context.repository, "listing", targetId);
+
+    const proposalKind = rootObjectKind === "request" ? "offer" : "bid";
+    const proposed = await runNestedCommand(
+      ["market", proposalKind, "submit"],
+      {
+        "data-dir": dataDir,
+        marketplace: targetState.marketplaceId,
+        "target-object-id": targetId,
+        "amount-sats": `${amountSats}`,
+        ...(proposerDid ? { "proposer-did": proposerDid } : {}),
+        ...(proposalId ? { id: proposalId } : {})
+      }
+    );
+    const proposedRecord = asRecord(proposed, `${proposalKind}.submit result`);
+    const resolvedProposalId = readString(proposedRecord.objectId, "objectId");
+
+    const existing = deals.findByRootObjectId(targetId);
+    const nowIso = now();
+    const deal = existing
+      ? await deals.update(existing.dealId, (current) => ({
+          ...current,
+          stage: "negotiating",
+          proposalKind,
+          proposalId: resolvedProposalId,
+          amountSats,
+          updatedAt: nowIso
+        }))
+      : await deals.save({
+          dealId: `deal:${randomUUID()}`,
+          stage: "negotiating",
+          intent: inferIntentFromRootObjectKind(rootObjectKind),
+          marketplaceId: targetState.marketplaceId,
+          title: "proposal-only-deal",
+          amountSats,
+          rootObjectKind,
+          rootObjectId: targetId,
+          proposalKind,
+          proposalId: resolvedProposalId,
+          createdAt: nowIso,
+          updatedAt: nowIso
+        });
+
+    writeDealResponse(io, "deal.propose", deal);
+  });
+}
+
+async function handleDealAccept(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const proposalId = requireOption(args, "proposal-id");
+  const proposalKind = inferProposalKindFromId(proposalId);
+
+  await withCliContext(dataDir, async () => {
+    const deals = await DealsStore.create(dataDir);
+    await runNestedCommand(["market", proposalKind, "accept"], {
+      "data-dir": dataDir,
+      id: proposalId
+    });
+
+    const existing = deals.findByProposalId(proposalId);
+    const nowIso = now();
+    const deal = existing
+      ? await deals.update(existing.dealId, (current) => ({
+          ...current,
+          stage: "agreed",
+          proposalKind,
+          proposalId,
+          updatedAt: nowIso
+        }))
+      : await deals.save({
+          dealId: `deal:${randomUUID()}`,
+          stage: "agreed",
+          proposalKind,
+          proposalId,
+          createdAt: nowIso,
+          updatedAt: nowIso
+        });
+
+    writeDealResponse(io, "deal.accept", deal);
+  });
+}
+
+async function handleDealStart(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const proposalId = requireOption(args, "proposal-id");
+  const scope = requireOption(args, "scope");
+  const milestoneId = requireOption(args, "milestone-id");
+  const milestoneTitle = requireOption(args, "milestone-title");
+  const deadline = parseOptionalIsoTimestamp(args, "deadline");
+  if (!deadline) {
+    throw new Error("--deadline is required");
+  }
+  const deliverableKind = parseEnum(requireOption(args, "deliverable-kind"), "--deliverable-kind", ["artifact", "generic", "oracle-claim"] as const);
+  const requiredArtifactKinds = getCsvOptionValues(args, "required-artifact-kind");
+  if (requiredArtifactKinds.length === 0) {
+    throw new Error("--required-artifact-kind must include at least one value");
+  }
+  const proposalKind = inferProposalKindFromId(proposalId);
+
+  await withCliContext(dataDir, async (context) => {
+    const deals = await DealsStore.create(dataDir);
+    const proposalState =
+      proposalKind === "offer"
+        ? await readRequiredState<Protocol.OfferState>(context.repository, "offer", proposalId)
+        : await readRequiredState<Protocol.BidState>(context.repository, "bid", proposalId);
+    if (proposalState.status !== "accepted") {
+      throw new Error(`Proposal must be accepted before deal start: ${proposalId}`);
+    }
+
+    const agreement = await runNestedCommand(
+      ["market", "agreement", "create"],
+      {
+        "data-dir": dataDir,
+        "source-kind": proposalKind,
+        "source-id": proposalId,
+        deliverable: [milestoneTitle],
+        counterparty: [context.identityMaterial.agentIdentity.did, proposalState.proposerDid],
+        "amount-sats": `${proposalState.paymentTerms.amountSats}`
+      }
+    );
+    const agreementRecord = asRecord(agreement, "agreement.create result");
+    const agreementId = readString(agreementRecord.objectId, "objectId");
+
+    const milestonesJson = JSON.stringify([{
+      milestoneId,
+      title: milestoneTitle,
+      deliverableSchema: {
+        kind: deliverableKind,
+        requiredArtifactKinds
+      },
+      proofPolicy: {
+        allowedModes: ["artifact-verifiable"],
+        verifierRefs: [],
+        minArtifacts: 1,
+        requireCounterpartyAcceptance: true
+      },
+      settlementAdapters: []
+    }]);
+
+    const contract = await runNestedCommand(
+      ["contract", "create"],
+      {
+        "data-dir": dataDir,
+        "origin-kind": "agreement",
+        "origin-id": agreementId,
+        party: [context.identityMaterial.agentIdentity.did, proposalState.proposerDid],
+        scope,
+        "milestones-json": milestonesJson,
+        "deliverable-schema-json": JSON.stringify({ kind: deliverableKind, requiredArtifactKinds }),
+        "proof-policy-json": JSON.stringify({
+          allowedModes: ["artifact-verifiable"],
+          verifierRefs: [],
+          minArtifacts: 1,
+          requireCounterpartyAcceptance: true
+        }),
+        "resolution-policy-json": JSON.stringify({ mode: "mutual", deterministicVerifierIds: [] }),
+        "settlement-policy-json": JSON.stringify({ adapters: [], releaseCondition: "contract-completed" }),
+        "deadline-policy-json": JSON.stringify({ milestoneDeadlines: { [milestoneId]: deadline } })
+      }
+    );
+    const contractRecord = asRecord(contract, "contract.create result");
+    const contractId = readString(contractRecord.objectId, "objectId");
+
+    await runNestedCommand(
+      ["contract", "open-milestone"],
+      {
+        "data-dir": dataDir,
+        id: contractId,
+        "milestone-id": milestoneId
+      }
+    );
+
+    const existing = deals.findByProposalId(proposalId);
+    const nowIso = now();
+    const deal = existing
+      ? await deals.update(existing.dealId, (current) => ({
+          ...current,
+          stage: "in_progress",
+          proposalKind,
+          proposalId,
+          agreementId,
+          contractId,
+          milestoneId,
+          updatedAt: nowIso
+        }))
+      : await deals.save({
+          dealId: `deal:${randomUUID()}`,
+          stage: "in_progress",
+          proposalKind,
+          proposalId,
+          agreementId,
+          contractId,
+          milestoneId,
+          createdAt: nowIso,
+          updatedAt: nowIso
+        });
+
+    writeDealResponse(io, "deal.start", deal);
+  });
+}
+
+async function handleDealStatus(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const dealId = requireOption(args, "deal-id");
+
+  const deals = await DealsStore.create(dataDir);
+  const deal = deals.get(dealId);
+  if (!deal) {
+    throw new Error(`Unknown deal: ${dealId}`);
+  }
+  writeDealResponse(io, "deal.status", deal);
+}
+
+async function handleProofSubmit(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const dealId = requireOption(args, "deal-id");
+  const milestoneId = requireOption(args, "milestone-id");
+  const preset = parseEnum(requireOption(args, "proof-preset"), "--proof-preset", ["simple-artifact"] as const);
+  if (preset !== "simple-artifact") {
+    throw new Error(`Unsupported --proof-preset: ${preset}`);
+  }
+  const artifactId = requireOption(args, "artifact-id");
+  const artifactHash = requireOption(args, "artifact-hash");
+  const repro = getOptionalOption(args, "repro");
+
+  await withCliContext(dataDir, async () => {
+    const deals = await DealsStore.create(dataDir);
+    const existing = deals.get(dealId);
+    if (!existing) {
+      throw new Error(`Unknown deal: ${dealId}`);
+    }
+    if (!existing.contractId) {
+      throw new Error("Deal has no contract yet; run deal start first");
+    }
+    if (!stageAtLeast(existing.stage, "in_progress")) {
+      throw new Error("Deal is not ready for proof submission");
+    }
+
+    const evidence = await runNestedCommand(
+      ["evidence", "record"],
+      {
+        "data-dir": dataDir,
+        "contract-id": existing.contractId,
+        "milestone-id": milestoneId,
+        "proof-mode": "artifact-verifiable",
+        "artifact-json": JSON.stringify([{ artifactId, hash: artifactHash }]),
+        "verifier-json": JSON.stringify([{ verifierId: "simple-artifact-check", verifierKind: "human-review" }]),
+        ...(repro ? { repro } : {})
+      }
+    );
+    const evidenceRecord = asRecord(evidence, "evidence.record result");
+    const evidenceId = readString(evidenceRecord.objectId, "objectId");
+
+    await runNestedCommand(
+      ["contract", "submit-milestone"],
+      {
+        "data-dir": dataDir,
+        id: existing.contractId,
+        "milestone-id": milestoneId,
+        "evidence-bundle-id": evidenceId
+      }
+    );
+
+    const nowIso = now();
+    const deal = await deals.update(dealId, (current) => ({
+      ...current,
+      stage: "proof_submitted",
+      milestoneId,
+      evidenceId,
+      updatedAt: nowIso
+    }));
+    writeDealResponse(io, "proof.submit", deal);
+  });
+}
+
+async function handleProofAccept(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const dealId = requireOption(args, "deal-id");
+  const milestoneId = requireOption(args, "milestone-id");
+
+  await withCliContext(dataDir, async () => {
+    const deals = await DealsStore.create(dataDir);
+    const existing = deals.get(dealId);
+    if (!existing) {
+      throw new Error(`Unknown deal: ${dealId}`);
+    }
+    if (!existing.contractId) {
+      throw new Error("Deal has no contract yet");
+    }
+    if (!stageAtLeast(existing.stage, "proof_submitted")) {
+      throw new Error("Deal proof must be submitted before acceptance");
+    }
+
+    await runNestedCommand(
+      ["contract", "accept-milestone"],
+      {
+        "data-dir": dataDir,
+        id: existing.contractId,
+        "milestone-id": milestoneId
+      }
+    );
+    const nowIso = now();
+    const deal = await deals.update(dealId, (current) => ({
+      ...current,
+      stage: "proof_accepted",
+      milestoneId,
+      updatedAt: nowIso
+    }));
+    writeDealResponse(io, "proof.accept", deal);
+  });
+}
+
+async function handleSettlementInvoiceCreate(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const dealId = requireOption(args, "deal-id");
+  const amountSats = parsePositiveInteger(requireOption(args, "amount-sats"), "--amount-sats");
+  const memo = getOptionalOption(args, "memo");
+  const expiresAt = parseOptionalIsoTimestamp(args, "expires-at");
+  const allowEarlySettlement = hasFlag(args, "allow-early-settlement");
+
+  await withCliContext(dataDir, async (context) => {
+    const deals = await DealsStore.create(dataDir);
+    const existing = deals.get(dealId);
+    if (!existing) {
+      throw new Error(`Unknown deal: ${dealId}`);
+    }
+    if (!allowEarlySettlement && !stageAtLeast(existing.stage, "proof_accepted")) {
+      throw new Error("Settlement invoice creation is proof-gated. Use --allow-early-settlement to override.");
+    }
+
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const created = await context.walletService.createInvoice({
+      amountSats,
+      ...(memo ? { memo } : {}),
+      ...(expiresAt ? { expiresAt } : {})
+    });
+    const nowIso = now();
+    const deal = await deals.update(dealId, (current) => ({
+      ...current,
+      stage: "settlement_pending",
+      invoiceId: created.invoice.id,
+      invoiceBolt11: created.bolt11,
+      updatedAt: nowIso
+    }));
+    writeDealResponse(io, "settlement.invoice.create", deal, {
+      safety: { earlySettlementAllowed: allowEarlySettlement }
+    });
+  });
+}
+
+async function handleSettlementPay(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const dealId = requireOption(args, "deal-id");
+  const invoice = requireOption(args, "invoice");
+  const allowEarlySettlement = hasFlag(args, "allow-early-settlement");
+
+  await withCliContext(dataDir, async (context) => {
+    const deals = await DealsStore.create(dataDir);
+    const existing = deals.get(dealId);
+    if (!existing) {
+      throw new Error(`Unknown deal: ${dealId}`);
+    }
+    if (!allowEarlySettlement && !stageAtLeast(existing.stage, "proof_accepted")) {
+      throw new Error("Settlement payment is proof-gated. Use --allow-early-settlement to override.");
+    }
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const sourceRef = existing.contractId
+      ? `${existing.contractId}:${existing.milestoneId ?? "milestone"}`
+      : dealId;
+    const paid = await context.walletService.payInvoice({
+      invoice,
+      sourceRef
+    });
+    const nowIso = now();
+    const deal = await deals.update(dealId, (current) => ({
+      ...current,
+      stage: "settled",
+      paymentId: paid.payment.id,
+      updatedAt: nowIso
+    }));
+    writeDealResponse(io, "settlement.pay", deal, {
+      safety: { earlySettlementAllowed: allowEarlySettlement }
+    });
+  });
+}
+
+async function handleSettlementStatus(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const dealId = requireOption(args, "deal-id");
+
+  const deals = await DealsStore.create(dataDir);
+  const deal = deals.get(dealId);
+  if (!deal) {
+    throw new Error(`Unknown deal: ${dealId}`);
+  }
+  writeDealResponse(io, "settlement.status", deal);
+}
+
 function usage(): string {
   return [
     "Usage:",
+    "  Global data-dir resolution: --data-dir <path> > --context <name> > active context",
+    "  emporion context add --name <context> --data-dir <path> [--make-active]",
+    "  emporion context use --name <context>",
+    "  emporion context list",
+    "  emporion context show",
+    "  emporion context remove --name <context>",
     "  emporion agent init --data-dir <path> [--display-name <name>] [--bio <text>]",
     "  emporion agent show --data-dir <path>",
     "  emporion wallet connect nwc --data-dir <path> --connection-uri <uri> [--publish-payment-endpoint]",
     "  emporion wallet disconnect --data-dir <path>",
     "  emporion wallet status --data-dir <path>",
+    "  emporion wallet unlock [--data-dir <path>|--context <name>] --wallet-key <key-material>",
+    "  emporion wallet lock [--data-dir <path>|--context <name>]",
     "  emporion wallet invoice create --data-dir <path> --amount-sats <n> [--memo <text>] [--expires-at <iso>]",
     "  emporion wallet pay bolt11 --data-dir <path> --invoice <bolt11>",
     "  emporion wallet ledger list --data-dir <path> [--kind <invoice|payment>] [--status <status>]",
     "  emporion wallet key rotate --data-dir <path> --new-key <key-material>",
+    "  emporion deal open [--data-dir <path>|--context <name>] --intent <buy|sell> --marketplace <id> --title <text> --amount-sats <n> [--deal-id <id>]",
+    "  emporion deal propose [--data-dir <path>|--context <name>] --target-id <object-id> --amount-sats <n> [--proposal-id <id>] [--proposer-did <did>]",
+    "  emporion deal accept [--data-dir <path>|--context <name>] --proposal-id <offer-or-bid-id>",
+    "  emporion deal start [--data-dir <path>|--context <name>] --proposal-id <offer-or-bid-id> --scope <text> --milestone-id <id> --milestone-title <text> --deadline <iso> --deliverable-kind <artifact|generic|oracle-claim> --required-artifact-kind <kind>[,<kind>...]",
+    "  emporion deal status [--data-dir <path>|--context <name>] --deal-id <id>",
+    "  emporion proof submit [--data-dir <path>|--context <name>] --deal-id <id> --milestone-id <id> --proof-preset <simple-artifact> --artifact-id <id> --artifact-hash <hex> [--repro <text>]",
+    "  emporion proof accept [--data-dir <path>|--context <name>] --deal-id <id> --milestone-id <id>",
+    "  emporion settlement invoice create [--data-dir <path>|--context <name>] --deal-id <id> --amount-sats <n> [--memo <text>] [--expires-at <iso>]",
+    "  emporion settlement pay [--data-dir <path>|--context <name>] --deal-id <id> --invoice <bolt11>",
+    "  emporion settlement status [--data-dir <path>|--context <name>] --deal-id <id>",
     "  emporion agent payment-endpoint add --data-dir <path> --id <id> --capability <cap>[,<cap>...]",
     "  emporion agent wallet-attestation add --data-dir <path> --attestation-id <id> --wallet-account-id <id> --balance-sats <n> --expires-at <iso>",
     "  emporion agent feedback add --data-dir <path> --credential-id <id> --issuer-did <did> --contract-id <id> --agreement-id <id> --score <n> --max-score <n>",
@@ -2315,6 +3038,30 @@ function getDataDirFromArgs(args: ParsedArgs): string | undefined {
   return getOptionalOption(args, "data-dir");
 }
 
+async function withResolvedDataDir(args: ParsedArgs): Promise<ParsedArgs> {
+  if (isContextCommand(args.commandPath)) {
+    return args;
+  }
+  if (getOptionalOption(args, "data-dir")) {
+    return args;
+  }
+  const requestedContext = getOptionalOption(args, "context");
+  const store = new ContextStore();
+  const resolved = await store.resolveDataDir(requestedContext);
+  if (requestedContext && !resolved) {
+    throw new Error(`Unknown context: ${requestedContext}`);
+  }
+  if (!resolved) {
+    return args;
+  }
+  const options = new Map<string, string[]>(args.options);
+  options.set("data-dir", [resolved]);
+  return {
+    commandPath: [...args.commandPath],
+    options
+  };
+}
+
 function withDaemonWalletKeyForwarding(args: ParsedArgs): ParsedArgs {
   if (!isWalletCommand(args.commandPath)) {
     return args;
@@ -2336,7 +3083,7 @@ function withDaemonWalletKeyForwarding(args: ParsedArgs): ParsedArgs {
 }
 
 function getDaemonProxyTimeoutMs(commandPath: string[]): number {
-  if (isWalletCommand(commandPath)) {
+  if (isWalletCommand(commandPath) || commandPath[0] === "settlement") {
     return WALLET_DAEMON_PROXY_TIMEOUT_MS;
   }
   return DEFAULT_DAEMON_PROXY_TIMEOUT_MS;
@@ -2928,107 +3675,126 @@ async function executeParsedArgs(args: ParsedArgs, io: CliIo, options: DispatchO
     return 0;
   }
 
-  if (commandMatches(args.commandPath, "daemon", "start")) return await handleDaemonStart(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "daemon", "status")) return await handleDaemonStatus(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "daemon", "stop")) return await handleDaemonStop(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "daemon", "logs")) return await handleDaemonLogs(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "daemon", "run")) return await handleDaemonRun(args, io).then(() => 0);
+  const resolvedArgs = await withResolvedDataDir(args);
+
+  if (commandMatches(resolvedArgs.commandPath, "daemon", "start")) return await handleDaemonStart(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "daemon", "status")) return await handleDaemonStatus(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "daemon", "stop")) return await handleDaemonStop(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "daemon", "logs")) return await handleDaemonLogs(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "daemon", "run")) return await handleDaemonRun(resolvedArgs, io).then(() => 0);
 
   if (options.allowDaemonProxy) {
-    const dataDir = getDataDirFromArgs(args);
+    const dataDir = getDataDirFromArgs(resolvedArgs);
     if (dataDir) {
       const activeDaemon = await probeDaemonStatus(dataDir, 1_000);
       if (activeDaemon) {
-        return proxyParsedArgsToDaemon(withDaemonWalletKeyForwarding(args), io);
+        return proxyParsedArgsToDaemon(withDaemonWalletKeyForwarding(resolvedArgs), io);
       }
     }
   }
 
-  if (commandMatches(args.commandPath, "agent", "init")) return await handleAgentInit(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "wallet", "connect", "nwc")) return await handleWalletConnectNwc(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "wallet", "disconnect")) return await handleWalletDisconnect(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "wallet", "status")) return await handleWalletStatus(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "wallet", "invoice", "create")) return await handleWalletInvoiceCreate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "wallet", "pay", "bolt11")) return await handleWalletPayBolt11(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "wallet", "ledger", "list")) return await handleWalletLedgerList(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "wallet", "key", "rotate")) return await handleWalletKeyRotate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "agent", "show")) return await handleAgentShow(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "agent", "payment-endpoint", "add")) return await handleAgentPaymentEndpointAdd(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "agent", "payment-endpoint", "remove")) return await handleAgentPaymentEndpointRemove(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "agent", "wallet-attestation", "add")) return await handleAgentWalletAttestationAdd(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "agent", "wallet-attestation", "remove")) return await handleAgentWalletAttestationRemove(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "agent", "feedback", "add")) return await handleAgentFeedbackAdd(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "agent", "feedback", "remove")) return await handleAgentFeedbackRemove(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "company", "create")) return await handleCompanyCreate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "company", "show")) return await handleCompanyShow(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "company", "update")) return await handleCompanyUpdate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "company", "grant-role")) return await handleCompanyRoleChange(args, io, "grant").then(() => 0);
-  if (commandMatches(args.commandPath, "company", "revoke-role")) return await handleCompanyRoleChange(args, io, "revoke").then(() => 0);
-  if (commandMatches(args.commandPath, "company", "join-market")) return await handleCompanyMarketMembership(args, io, "join").then(() => 0);
-  if (commandMatches(args.commandPath, "company", "leave-market")) return await handleCompanyMarketMembership(args, io, "leave").then(() => 0);
-  if (commandMatches(args.commandPath, "company", "treasury-attest")) return await handleCompanyTreasuryAttest(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "company", "treasury-reserve")) return await handleCompanyTreasuryReserve(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "company", "treasury-release")) return await handleCompanyTreasuryRelease(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "product", "create")) return await handleMarketProductCreate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "product", "update")) return await handleMarketProductUpdate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "product", "publish")) return await handleMarketProductStateChange(args, io, "product.published").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "product", "unpublish")) return await handleMarketProductStateChange(args, io, "product.unpublished").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "product", "retire")) return await handleMarketProductStateChange(args, io, "product.retired").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "listing", "publish")) return await handleMarketListingPublish(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "listing", "revise")) return await handleMarketListingRevise(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "listing", "withdraw")) return await handleSimpleMarketStateChange(args, io, "listing", "listing.withdrawn").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "listing", "expire")) return await handleSimpleMarketStateChange(args, io, "listing", "listing.expired").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "request", "publish")) return await handleMarketRequestPublish(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "request", "revise")) return await handleMarketRequestRevise(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "request", "close")) return await handleSimpleMarketStateChange(args, io, "request", "request.closed").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "request", "expire")) return await handleSimpleMarketStateChange(args, io, "request", "request.expired").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "offer", "submit")) return await handleMarketOfferSubmit(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "offer", "counter")) return await handleMarketOfferCounter(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "offer", "accept")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.accepted").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "offer", "reject")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.rejected").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "offer", "cancel")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.canceled").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "offer", "expire")) return await handleSimpleMarketStateChange(args, io, "offer", "offer.expired").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "bid", "submit")) return await handleMarketBidSubmit(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "bid", "counter")) return await handleMarketBidCounter(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "bid", "accept")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.accepted").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "bid", "reject")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.rejected").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "bid", "cancel")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.canceled").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "bid", "expire")) return await handleSimpleMarketStateChange(args, io, "bid", "bid.expired").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "agreement", "create")) return await handleMarketAgreementCreate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "market", "agreement", "complete")) return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.completed").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "agreement", "cancel")) return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.canceled").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "agreement", "dispute")) return await handleSimpleMarketStateChange(args, io, "agreement", "agreement.disputed").then(() => 0);
-  if (commandMatches(args.commandPath, "market", "list")) return await handleMarketList(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "create")) return await handleContractCreate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "open-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-opened").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "submit-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-submitted").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "accept-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-accepted").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "reject-milestone")) return await handleContractMilestoneAction(args, io, "contract.milestone-rejected").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "pause")) return await handleContractStateChange(args, io, "contract.paused").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "resume")) return await handleContractStateChange(args, io, "contract.resumed").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "complete")) return await handleContractStateChange(args, io, "contract.completed").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "cancel")) return await handleContractStateChange(args, io, "contract.canceled").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "dispute")) return await handleContractStateChange(args, io, "contract.disputed").then(() => 0);
-  if (commandMatches(args.commandPath, "contract", "entries")) return await handleContractEntries(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "evidence", "record")) return await handleEvidenceRecord(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "oracle", "attest")) return await handleOracleAttest(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "dispute", "open")) return await handleDisputeOpen(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "dispute", "add-evidence")) return await handleDisputeAddEvidence(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "dispute", "request-oracle")) return await handleDisputeRequestOracle(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "dispute", "rule")) return await handleDisputeRule(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "dispute", "close")) return await handleDisputeClose(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "space", "create")) return await handleSpaceCreate(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "space", "add-member")) return await handleSpaceMembershipAction(args, io, "space-membership.member-added").then(() => 0);
-  if (commandMatches(args.commandPath, "space", "remove-member")) return await handleSpaceMembershipAction(args, io, "space-membership.member-removed").then(() => 0);
-  if (commandMatches(args.commandPath, "space", "mute-member")) return await handleSpaceMembershipAction(args, io, "space-membership.member-muted").then(() => 0);
-  if (commandMatches(args.commandPath, "space", "set-role")) return await handleSpaceMembershipAction(args, io, "space-membership.member-role-updated").then(() => 0);
-  if (commandMatches(args.commandPath, "space", "entries")) return await handleSpaceEntries(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "message", "send")) return await handleMessageSend(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "message", "edit")) return await handleMessageEdit(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "message", "delete")) return await handleMessageDelete(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "message", "react")) return await handleMessageReact(args, io).then(() => 0);
-  if (commandMatches(args.commandPath, "object", "show")) return await handleObjectShow(args, io).then(() => 0);
-  throw new Error(`Unknown command: ${args.commandPath.join(" ")}`);
+  if (commandMatches(resolvedArgs.commandPath, "context", "add")) return await handleContextAdd(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "context", "use")) return await handleContextUse(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "context", "list")) return await handleContextList(io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "context", "show")) return await handleContextShow(io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "context", "remove")) return await handleContextRemove(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "init")) return await handleAgentInit(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "connect", "nwc")) return await handleWalletConnectNwc(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "disconnect")) return await handleWalletDisconnect(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "status")) return await handleWalletStatus(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "unlock")) return await handleWalletUnlock(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "lock")) return await handleWalletLock(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "invoice", "create")) return await handleWalletInvoiceCreate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "pay", "bolt11")) return await handleWalletPayBolt11(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "ledger", "list")) return await handleWalletLedgerList(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "key", "rotate")) return await handleWalletKeyRotate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "deal", "open")) return await handleDealOpen(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "deal", "propose")) return await handleDealPropose(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "deal", "accept")) return await handleDealAccept(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "deal", "start")) return await handleDealStart(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "deal", "status")) return await handleDealStatus(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "proof", "submit")) return await handleProofSubmit(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "proof", "accept")) return await handleProofAccept(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "settlement", "invoice", "create")) return await handleSettlementInvoiceCreate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "settlement", "pay")) return await handleSettlementPay(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "settlement", "status")) return await handleSettlementStatus(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "show")) return await handleAgentShow(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "payment-endpoint", "add")) return await handleAgentPaymentEndpointAdd(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "payment-endpoint", "remove")) return await handleAgentPaymentEndpointRemove(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "wallet-attestation", "add")) return await handleAgentWalletAttestationAdd(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "wallet-attestation", "remove")) return await handleAgentWalletAttestationRemove(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "feedback", "add")) return await handleAgentFeedbackAdd(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "agent", "feedback", "remove")) return await handleAgentFeedbackRemove(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "create")) return await handleCompanyCreate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "show")) return await handleCompanyShow(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "update")) return await handleCompanyUpdate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "grant-role")) return await handleCompanyRoleChange(resolvedArgs, io, "grant").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "revoke-role")) return await handleCompanyRoleChange(resolvedArgs, io, "revoke").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "join-market")) return await handleCompanyMarketMembership(resolvedArgs, io, "join").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "leave-market")) return await handleCompanyMarketMembership(resolvedArgs, io, "leave").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "treasury-attest")) return await handleCompanyTreasuryAttest(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "treasury-reserve")) return await handleCompanyTreasuryReserve(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "company", "treasury-release")) return await handleCompanyTreasuryRelease(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "product", "create")) return await handleMarketProductCreate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "product", "update")) return await handleMarketProductUpdate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "product", "publish")) return await handleMarketProductStateChange(resolvedArgs, io, "product.published").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "product", "unpublish")) return await handleMarketProductStateChange(resolvedArgs, io, "product.unpublished").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "product", "retire")) return await handleMarketProductStateChange(resolvedArgs, io, "product.retired").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "listing", "publish")) return await handleMarketListingPublish(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "listing", "revise")) return await handleMarketListingRevise(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "listing", "withdraw")) return await handleSimpleMarketStateChange(resolvedArgs, io, "listing", "listing.withdrawn").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "listing", "expire")) return await handleSimpleMarketStateChange(resolvedArgs, io, "listing", "listing.expired").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "request", "publish")) return await handleMarketRequestPublish(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "request", "revise")) return await handleMarketRequestRevise(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "request", "close")) return await handleSimpleMarketStateChange(resolvedArgs, io, "request", "request.closed").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "request", "expire")) return await handleSimpleMarketStateChange(resolvedArgs, io, "request", "request.expired").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "offer", "submit")) return await handleMarketOfferSubmit(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "offer", "counter")) return await handleMarketOfferCounter(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "offer", "accept")) return await handleSimpleMarketStateChange(resolvedArgs, io, "offer", "offer.accepted").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "offer", "reject")) return await handleSimpleMarketStateChange(resolvedArgs, io, "offer", "offer.rejected").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "offer", "cancel")) return await handleSimpleMarketStateChange(resolvedArgs, io, "offer", "offer.canceled").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "offer", "expire")) return await handleSimpleMarketStateChange(resolvedArgs, io, "offer", "offer.expired").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "bid", "submit")) return await handleMarketBidSubmit(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "bid", "counter")) return await handleMarketBidCounter(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "bid", "accept")) return await handleSimpleMarketStateChange(resolvedArgs, io, "bid", "bid.accepted").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "bid", "reject")) return await handleSimpleMarketStateChange(resolvedArgs, io, "bid", "bid.rejected").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "bid", "cancel")) return await handleSimpleMarketStateChange(resolvedArgs, io, "bid", "bid.canceled").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "bid", "expire")) return await handleSimpleMarketStateChange(resolvedArgs, io, "bid", "bid.expired").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "agreement", "create")) return await handleMarketAgreementCreate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "agreement", "complete")) return await handleSimpleMarketStateChange(resolvedArgs, io, "agreement", "agreement.completed").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "agreement", "cancel")) return await handleSimpleMarketStateChange(resolvedArgs, io, "agreement", "agreement.canceled").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "agreement", "dispute")) return await handleSimpleMarketStateChange(resolvedArgs, io, "agreement", "agreement.disputed").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "market", "list")) return await handleMarketList(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "create")) return await handleContractCreate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "open-milestone")) return await handleContractMilestoneAction(resolvedArgs, io, "contract.milestone-opened").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "submit-milestone")) return await handleContractMilestoneAction(resolvedArgs, io, "contract.milestone-submitted").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "accept-milestone")) return await handleContractMilestoneAction(resolvedArgs, io, "contract.milestone-accepted").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "reject-milestone")) return await handleContractMilestoneAction(resolvedArgs, io, "contract.milestone-rejected").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "pause")) return await handleContractStateChange(resolvedArgs, io, "contract.paused").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "resume")) return await handleContractStateChange(resolvedArgs, io, "contract.resumed").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "complete")) return await handleContractStateChange(resolvedArgs, io, "contract.completed").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "cancel")) return await handleContractStateChange(resolvedArgs, io, "contract.canceled").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "dispute")) return await handleContractStateChange(resolvedArgs, io, "contract.disputed").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "contract", "entries")) return await handleContractEntries(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "evidence", "record")) return await handleEvidenceRecord(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "oracle", "attest")) return await handleOracleAttest(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "dispute", "open")) return await handleDisputeOpen(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "dispute", "add-evidence")) return await handleDisputeAddEvidence(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "dispute", "request-oracle")) return await handleDisputeRequestOracle(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "dispute", "rule")) return await handleDisputeRule(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "dispute", "close")) return await handleDisputeClose(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "space", "create")) return await handleSpaceCreate(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "space", "add-member")) return await handleSpaceMembershipAction(resolvedArgs, io, "space-membership.member-added").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "space", "remove-member")) return await handleSpaceMembershipAction(resolvedArgs, io, "space-membership.member-removed").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "space", "mute-member")) return await handleSpaceMembershipAction(resolvedArgs, io, "space-membership.member-muted").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "space", "set-role")) return await handleSpaceMembershipAction(resolvedArgs, io, "space-membership.member-role-updated").then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "space", "entries")) return await handleSpaceEntries(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "message", "send")) return await handleMessageSend(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "message", "edit")) return await handleMessageEdit(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "message", "delete")) return await handleMessageDelete(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "message", "react")) return await handleMessageReact(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "object", "show")) return await handleObjectShow(resolvedArgs, io).then(() => 0);
+  throw new Error(`Unknown command: ${resolvedArgs.commandPath.join(" ")}`);
 }
 
 export async function runCli(argv: string[], io: CliIo = DEFAULT_IO): Promise<number> {

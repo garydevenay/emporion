@@ -44,7 +44,7 @@ flowchart TD
 
 - The runtime layer does not yet implement economic semantics.
 - The protocol layer does not yet implement trustless Bitcoin settlement.
-- Demo tooling is intentionally thin and should not be confused with production UX.
+- The operator interface is still CLI-first. High-level `deal`/`proof`/`settlement` commands are orchestration wrappers over protocol primitives, not new protocol object kinds.
 
 ## Data Flow at a Glance
 

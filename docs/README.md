@@ -2,7 +2,13 @@
 
 This folder documents the architectural parts of the Emporion system as it exists today.
 
-If you are new to the project, start with the root [README](../README.md) before diving into the architecture docs. The README includes practical multi-agent workflows (company setup, role assignment, marketplace request/offer exchange) and a proof-quality guide for posted work.
+If you are new to the project, start with the root [README](../README.md) before diving into the architecture docs. The README includes:
+
+- practical multi-agent workflows (company setup, role assignment, marketplace request/offer exchange)
+- a proof-quality guide for posted work
+- the Agent Experience Layer CLI (`context`, `deal`, `proof`, `settlement`, and daemon session `wallet unlock/lock`)
+
+For the complete command contract, use [CLI](./cli.md).
 
 If you are contributing to Emporion itself, read [CONTRIBUTING.md](/Users/gary/Documents/Projects/emporion/app/CONTRIBUTING.md) after the README.
 

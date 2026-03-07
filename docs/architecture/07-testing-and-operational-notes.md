@@ -55,6 +55,7 @@ Wallet tests now verify:
   - connection metadata + encrypted secret under `<data-dir>/runtime/wallet`
   - invoice/payment/auto-settle ledger under `<data-dir>/runtime/wallet/ledger.v1.json`
 - Daemon can start without wallet key; wallet status reports `autoSettleEnabled: false` until a valid key is provided via env/proxied wallet command.
+- With the current CLI, daemon wallet sessions can be unlocked/locked explicitly via `wallet unlock` and `wallet lock` (in-memory only, cleared on daemon stop).
 - Auto-settle is currently unrestricted in v1 and runs on accepted offer/bid + active agreement opportunities when actionable Lightning refs are present.
 
 ## Current Limitations
@@ -62,7 +63,7 @@ Wallet tests now verify:
 - no trustless Bitcoin settlement
 - no protocol-replicated wallet ledger objects (runtime-only ledger in v1)
 - no company transfer protocol
-- no hiring workflow yet
+- no protocol-native hiring workflow yet (current `deal` commands are local orchestration wrappers)
 - no protocol-level escrow
 - no final product storefront UX
 

@@ -11,6 +11,8 @@ export {
 export * as Protocol from "./protocol/index.js";
 export { topicRefToCanonicalString, topicRefToDiscoveryKey } from "./topics.js";
 export { WalletService } from "./wallet/service.js";
+export { ContextStore, EMPORION_CONTEXTS_FILE_ENV } from "./context-store.js";
+export { DealsStore, type DealRecord, type DealStage } from "./experience/deals-store.js";
 export {
   NostrWalletConnectAdapter,
   isNostrWalletConnectUri,
