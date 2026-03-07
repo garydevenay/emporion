@@ -47,18 +47,26 @@ test("two agents discover each other, complete the handshake, and replicate the 
     });
 
     const eventsFeedA = await agentA.openFeed("events");
-    await eventsFeedA.append({
-      type: "offer",
-      payload: "hello-market",
-      createdAt: new Date().toISOString()
-    });
-
     const feedKey = eventsFeedA.key.toString("hex");
     const remoteEventsDescriptorOnB = [...agentB.getPeerSessions().values()][0]?.replication.find(
       (descriptor) => descriptor.name === "events"
     );
     assert.ok(remoteEventsDescriptorOnB);
     assert.equal(remoteEventsDescriptorOnB.key, feedKey);
+    await waitFor(() => {
+      const feed = agentB.getRemoteFeed(remoteEventsDescriptorOnB.key);
+      return feed && Array.isArray(feed.peers) && feed.peers.length > 0 ? feed : null;
+    }, {
+      timeoutMs: 10_000,
+      message: "Remote events feed did not attach to a replication peer"
+    });
+
+    await eventsFeedA.append({
+      type: "offer",
+      payload: "hello-market",
+      createdAt: new Date().toISOString()
+    });
+
     const remoteFeed = await waitFor(async () => {
       const feed = agentB.getRemoteFeed(remoteEventsDescriptorOnB.key) ?? null;
       if (!feed) {
@@ -84,16 +92,24 @@ test("two agents discover each other, complete the handshake, and replicate the 
     assert.equal(typeof replicatedRecord.createdAt, "string");
 
     const eventsFeedB = await agentB.openFeed("events");
+    const remoteEventsDescriptorOnA = [...agentA.getPeerSessions().values()][0]?.replication.find(
+      (descriptor) => descriptor.name === "events"
+    );
+    assert.ok(remoteEventsDescriptorOnA);
+    await waitFor(() => {
+      const feed = agentA.getRemoteFeed(remoteEventsDescriptorOnA.key);
+      return feed && Array.isArray(feed.peers) && feed.peers.length > 0 ? feed : null;
+    }, {
+      timeoutMs: 10_000,
+      message: "Peer A remote events feed did not attach to a replication peer"
+    });
+
     await eventsFeedB.append({
       type: "bid",
       payload: "reply-from-b",
       createdAt: new Date().toISOString()
     });
 
-    const remoteEventsDescriptorOnA = [...agentA.getPeerSessions().values()][0]?.replication.find(
-      (descriptor) => descriptor.name === "events"
-    );
-    assert.ok(remoteEventsDescriptorOnA);
     const remoteFeedOnA = await waitFor(async () => {
       const feed = agentA.getRemoteFeed(remoteEventsDescriptorOnA.key) ?? null;
       if (!feed) {
