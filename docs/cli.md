@@ -36,6 +36,9 @@ Runtime artifacts live under `<data-dir>/runtime`:
 - `daemon.pid`
 - `daemon.log`
 - `daemon.sock` on POSIX or a deterministic named pipe on Windows
+- `wallet/connection.metadata.json` (non-secret wallet metadata)
+- `wallet/connection.secret.enc.json` (AES-256-GCM encrypted wallet secret)
+- `wallet/ledger.v1.json` (local-only invoice/payment/auto-settle ledger)
 
 ## Output Conventions
 
@@ -52,6 +55,7 @@ Common response fields:
 - `state`: current materialized state for the object that was changed
 - `entries`: index or log entries returned by a read command
 - `status`: daemon status object returned by daemon commands
+- `wallet`: wallet runtime status returned by wallet commands
 
 Error behavior:
 
@@ -67,6 +71,7 @@ Common flags used across the CLI:
 - repeated flags are supported, for example `--party did:a --party did:b`
 - comma-separated multi-values are also supported for some flags, for example `--capability receive,send`
 - boolean flags are passed without a value, for example `--agent-topic` or `--custodial`
+- environment key for wallet secret unlock: `EMPORION_WALLET_KEY` (required for wallet connect, pay/invoice actions, and daemon startup when a wallet is already configured)
 
 Common enum values:
 
@@ -195,6 +200,14 @@ Response payload:
     "logPath": "/abs/path/to/runtime/daemon.log",
     "topics": [],
     "connectedPeers": [],
+    "wallet": {
+      "connected": true,
+      "backend": "nwc",
+      "network": "bitcoin",
+      "autoSettleEnabled": true,
+      "pendingPayments": 1,
+      "pendingInvoices": 0
+    },
     "healthy": true
   }
 }
@@ -244,6 +257,14 @@ Response payload:
       }
     ],
     "connectedPeers": [],
+    "wallet": {
+      "connected": true,
+      "backend": "nwc",
+      "network": "bitcoin",
+      "autoSettleEnabled": true,
+      "pendingPayments": 0,
+      "pendingInvoices": 0
+    },
     "healthy": true
   }
 }
@@ -320,6 +341,141 @@ How to use it:
 
 - monitor discovery events and transport warnings
 - troubleshoot peer connection, handshake, and replication issues
+
+## Wallet Commands
+
+Wallet commands operate on a local daemon/runtime wallet model. v1 uses an NWC backend and persists ledger records locally only.
+
+### `wallet connect nwc`
+
+Purpose: connect an NWC wallet endpoint and persist the encrypted wallet secret in `<data-dir>/runtime/wallet`.
+
+Usage:
+
+```bash
+EMPORION_WALLET_KEY="your-unlock-key" emporion wallet connect nwc \
+  --data-dir ./tmp/agent-a \
+  --connection-uri 'nwc+https://wallet.example/rpc?token=abc'
+```
+
+Nostr relay mode is also supported:
+
+```bash
+EMPORION_WALLET_KEY="your-unlock-key" emporion wallet connect nwc \
+  --data-dir ./tmp/agent-a \
+  --connection-uri 'nostr+walletconnect://<wallet-pubkey>?relay=wss://relay.damus.io&relay=wss://nos.lol&secret=<hex-secret>'
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--connection-uri <nwc+http(s)://... | nostr+walletconnect://...>`
+- optional: `--wallet-key <key>` (useful when running through an already-running daemon)
+- optional flag: `--publish-payment-endpoint`
+- optional with publish flag: `--payment-endpoint-id <id>`
+- optional with publish flag: `--payment-capability <cap>[,<cap>...]`
+- optional with publish flag: `--payment-account-id <id>`
+
+Response payload:
+
+```json
+{
+  "command": "wallet.connect.nwc",
+  "wallet": {
+    "connected": true,
+    "backend": "nwc",
+    "network": "bitcoin",
+    "autoSettleEnabled": true,
+    "pendingInvoices": 0,
+    "pendingPayments": 0,
+    "locked": false
+  },
+  "endpoint": "https://wallet.example/rpc"
+}
+```
+
+### `wallet disconnect`
+
+Purpose: clear stored wallet connection metadata + encrypted secret.
+
+Usage:
+
+```bash
+emporion wallet disconnect --data-dir ./tmp/agent-a
+```
+
+### `wallet status`
+
+Purpose: inspect wallet connection and lock status.
+
+Usage:
+
+```bash
+emporion wallet status --data-dir ./tmp/agent-a
+```
+
+When a daemon is already running for this `data-dir`, wallet commands are proxied over IPC. The CLI automatically forwards `EMPORION_WALLET_KEY` to the daemon for wallet commands; you can also pass `--wallet-key` explicitly.
+Daemon-proxied wallet commands use a longer IPC timeout window than non-wallet commands so provider/network latency does not fail invoice or pay operations prematurely.
+Code updates to wallet/CLI logic are loaded on daemon process start. After upgrading source, restart the daemon once to pick up new wallet parsing/runtime behavior.
+
+### `wallet invoice create`
+
+Purpose: generate a Lightning invoice through the connected wallet backend and persist a local invoice ledger record.
+
+Nostr compatibility notes:
+
+- invoice amounts are sent to `nostr+walletconnect` in millisatoshis (NIP-47 `amount` units), while CLI/API options remain sats.
+- `nostr+walletconnect` backends are tolerant to provider variants for invoice fields (`invoice|bolt11|payment_request|pr`) and invoice references (`payment_hash|r_hash|id|external_ref`).
+- when a provider omits a payment hash, the runtime falls back to tracking by invoice string and uses `lookup_invoice` with `invoice=<bolt11>`.
+
+Usage:
+
+```bash
+EMPORION_WALLET_KEY="your-unlock-key" emporion wallet invoice create \
+  --data-dir ./tmp/agent-a \
+  --amount-sats 25000 \
+  --memo "milestone payout"
+```
+
+### `wallet pay bolt11`
+
+Purpose: pay a BOLT11 invoice through the connected wallet backend and persist a local payment record.
+
+Usage:
+
+```bash
+EMPORION_WALLET_KEY="your-unlock-key" emporion wallet pay bolt11 \
+  --data-dir ./tmp/agent-a \
+  --invoice lnbc...
+```
+
+### `wallet ledger list`
+
+Purpose: inspect local runtime-only wallet ledger records.
+
+Usage:
+
+```bash
+emporion wallet ledger list --data-dir ./tmp/agent-a --kind payment --status pending
+```
+
+Request options:
+
+- required: `--data-dir`
+- optional: `--kind <invoice|payment>`
+- optional: `--status <status>`
+
+### `wallet key rotate`
+
+Purpose: re-encrypt the stored wallet secret with new key material.
+
+Usage:
+
+```bash
+EMPORION_WALLET_KEY="old-key" emporion wallet key rotate \
+  --data-dir ./tmp/agent-a \
+  --new-key "new-key"
+```
 
 ## Agent Commands
 

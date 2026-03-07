@@ -49,6 +49,7 @@
     "hyperdht": "^6.29.1",
     "hyperswarm": "^4.17.0",
     "key-did-resolver": "^4.0.0",
+    "nostr-tools": "^2.23.3",
     "peer-did-resolver": "^2.0.0",
     "tweetnacl": "^1.0.3"
   },

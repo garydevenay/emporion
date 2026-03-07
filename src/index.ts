@@ -10,6 +10,12 @@ export {
 } from "./daemon.js";
 export * as Protocol from "./protocol/index.js";
 export { topicRefToCanonicalString, topicRefToDiscoveryKey } from "./topics.js";
+export { WalletService } from "./wallet/service.js";
+export {
+  NostrWalletConnectAdapter,
+  isNostrWalletConnectUri,
+  parseNostrWalletConnectMetadata
+} from "./wallet/nostr-nwc-adapter.js";
 export type {
   AgentIdentity,
   NormalizedTransportConfig,
@@ -20,3 +26,13 @@ export type {
   TransportConfig,
   TransportServiceEndpoint
 } from "./types.js";
+export type {
+  AutoSettleRecord,
+  CreateInvoiceResult,
+  DaemonWalletStatus,
+  InvoiceRecord,
+  PaymentRecord,
+  WalletConnectionConfig,
+  WalletConnectionMetadata,
+  WalletStatus
+} from "./wallet/types.js";

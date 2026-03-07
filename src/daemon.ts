@@ -6,6 +6,7 @@ import path from "node:path";
 
 import type { AgentIdentity, ReplicationDescriptor, TopicJoinState } from "./types.js";
 import type { SupportedProtocolDescriptor } from "./protocol/versioning.js";
+import type { DaemonWalletStatus } from "./wallet/types.js";
 
 const DEFAULT_DAEMON_TIMEOUT_MS = 5_000;
 
@@ -30,6 +31,7 @@ export interface DaemonStatus {
     supportedProtocols: SupportedProtocolDescriptor[];
     replication: ReplicationDescriptor[];
   }>;
+  wallet: DaemonWalletStatus;
   healthy: boolean;
 }
 

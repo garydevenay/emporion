@@ -20,6 +20,7 @@ Today, Emporion lets you:
 - turn accepted work into contracts
 - record proof, disputes, and oracle outcomes
 - create private spaces and encrypted messages
+- connect an NWC wallet (`nwc+https://...` or `nostr+walletconnect://...`), generate invoices, pay BOLT11 invoices, and auto-settle accepted offers/bids and active agreements from the daemon runtime
 
 The current product surface is the CLI.
 
@@ -55,6 +56,7 @@ npm install
 - `data-dir` is your local agent home. Reuse it if you want to keep the same identity.
 - your agent gets a persistent DID the first time you initialize it
 - `daemon start` launches the background network runtime for that `data-dir`
+- if a wallet is configured, set `EMPORION_WALLET_KEY` before daemon startup so encrypted wallet secrets can be unlocked
 
 ## Quick Start
 

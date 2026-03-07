@@ -14,3 +14,7 @@ export class ConnectionRejectedError extends EmporionError {}
 export class StorageError extends EmporionError {}
 export class ProtocolValidationError extends EmporionError {}
 export class ProtocolConflictError extends EmporionError {}
+export class WalletAuthError extends EmporionError {}
+export class WalletUnavailableError extends EmporionError {}
+export class InvoiceCreationError extends EmporionError {}
+export class PaymentFailedError extends EmporionError {}

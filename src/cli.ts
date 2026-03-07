@@ -32,6 +32,7 @@ import { sha256Hex, type ProtocolJsonObject, type ProtocolValue } from "./protoc
 import type { IdentityMaterial } from "./identity.js";
 import { TransportStorage } from "./storage.js";
 import type { TopicRef, TransportConfig } from "./types.js";
+import { WalletService, type AutoSettleCandidate } from "./wallet/index.js";
 
 interface CliIo {
   stdout(message: string): void;
@@ -48,6 +49,7 @@ interface CliContext {
   identityMaterial: IdentityMaterial;
   repository: Protocol.ProtocolRepository;
   transportStorage: TransportStorage;
+  walletService: WalletService;
   signer: Protocol.ProtocolSigner;
 }
 
@@ -57,6 +59,9 @@ type CliContextRunner = <T>(dataDir: string, fn: (context: CliContext) => Promis
 interface DispatchOptions {
   allowDaemonProxy: boolean;
 }
+
+const DEFAULT_DAEMON_PROXY_TIMEOUT_MS = 5_000;
+const WALLET_DAEMON_PROXY_TIMEOUT_MS = 30_000;
 
 const DEFAULT_IO: CliIo = {
   stdout(message) {
@@ -103,6 +108,10 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 function commandMatches(commandPath: string[], ...expected: string[]): boolean {
   return commandPath.length === expected.length && expected.every((value, index) => commandPath[index] === value);
+}
+
+function isWalletCommand(commandPath: string[]): boolean {
+  return commandPath[0] === "wallet";
 }
 
 function getOptionValues(args: ParsedArgs, name: string): string[] {
@@ -152,6 +161,18 @@ function parseNonNegativeInteger(value: string, fieldName: string): number {
 function parseOptionalNonNegativeInteger(args: ParsedArgs, name: string): number | undefined {
   const value = getOptionalOption(args, name);
   return value === undefined ? undefined : parseNonNegativeInteger(value, `--${name}`);
+}
+
+function parseOptionalIsoTimestamp(args: ParsedArgs, name: string): string | undefined {
+  const value = getOptionalOption(args, name);
+  if (value === undefined) {
+    return undefined;
+  }
+  const epochMs = Date.parse(value);
+  if (Number.isNaN(epochMs)) {
+    throw new Error(`--${name} must be a valid ISO-8601 timestamp`);
+  }
+  return new Date(epochMs).toISOString();
 }
 
 function parseEnum<T extends string>(value: string, fieldName: string, allowed: readonly T[]): T {
@@ -287,6 +308,7 @@ async function openCliContext(dataDir: string): Promise<CliContext> {
   const identityMaterial = await loadPersistentIdentityMaterial(dataDir);
   const repository = await Protocol.ProtocolRepository.create(dataDir);
   const transportStorage = await TransportStorage.create(dataDir, identityMaterial.storagePrimaryKey, createLogger("error"));
+  const walletService = await WalletService.create({ dataDir });
   await transportStorage.initializeDefaults();
 
   return {
@@ -294,6 +316,7 @@ async function openCliContext(dataDir: string): Promise<CliContext> {
     identityMaterial,
     repository,
     transportStorage,
+    walletService,
     signer: {
       did: identityMaterial.agentIdentity.did,
       publicKey: identityMaterial.transportKeyPair.publicKey,
@@ -303,6 +326,7 @@ async function openCliContext(dataDir: string): Promise<CliContext> {
 }
 
 async function closeCliContext(context: CliContext): Promise<void> {
+  await context.walletService.close();
   await context.transportStorage.close();
   await context.repository.close();
 }
@@ -2100,11 +2124,165 @@ async function handleMarketList(args: ParsedArgs, io: CliIo): Promise<void> {
   });
 }
 
+function applyWalletRuntimeKeyFromArgs(context: CliContext, args: ParsedArgs): void {
+  const walletKey = getOptionalOption(args, "wallet-key");
+  if (walletKey && walletKey.trim().length > 0) {
+    context.walletService.setRuntimeKey(walletKey);
+  }
+}
+
+async function handleWalletConnectNwc(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const connectionUri = requireOption(args, "connection-uri");
+  const publishEndpoint = hasFlag(args, "publish-payment-endpoint");
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const connected = await context.walletService.connect(connectionUri);
+    let paymentEndpointEventId: string | undefined;
+
+    if (publishEndpoint) {
+      await ensureAgentProfileExists(context);
+      const capabilities = getCsvOptionValues(args, "payment-capability");
+      const accountId = getOptionalOption(args, "payment-account-id");
+      const endpoint: Protocol.PaymentEndpoint = {
+        id: getOptionalOption(args, "payment-endpoint-id") ?? "wallet-nwc",
+        network: "bitcoin",
+        custodial: true,
+        capabilities: capabilities.length > 0 ? capabilities : ["invoice.create", "invoice.pay", "auto-settle"],
+        ...(accountId ? { accountId } : {}),
+        nodeUri: connected.endpoint
+      };
+      const result = await appendEnvelope(context, {
+        objectKind: "agent-profile",
+        objectId: context.identityMaterial.agentIdentity.did,
+        eventKind: "agent-profile.payment-endpoint-added",
+        subjectId: context.identityMaterial.agentIdentity.did,
+        payload: Protocol.paymentEndpointToJson(endpoint)
+      });
+      paymentEndpointEventId = result.envelope.eventId;
+    }
+
+    writeJson(io, {
+      command: "wallet.connect.nwc",
+      wallet: connected.status,
+      endpoint: connected.endpoint,
+      ...(paymentEndpointEventId ? { paymentEndpointEventId } : {})
+    });
+  });
+}
+
+async function handleWalletDisconnect(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const wallet = await context.walletService.disconnect();
+    writeJson(io, {
+      command: "wallet.disconnect",
+      wallet
+    });
+  });
+}
+
+async function handleWalletStatus(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    writeJson(io, {
+      command: "wallet.status",
+      wallet: await context.walletService.status()
+    });
+  });
+}
+
+async function handleWalletInvoiceCreate(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const amountSats = parsePositiveInteger(requireOption(args, "amount-sats"), "--amount-sats");
+  const memo = getOptionalOption(args, "memo");
+  const expiresAt = parseOptionalIsoTimestamp(args, "expires-at");
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const created = await context.walletService.createInvoice({
+      amountSats,
+      ...(memo ? { memo } : {}),
+      ...(expiresAt ? { expiresAt } : {})
+    });
+    writeJson(io, {
+      command: "wallet.invoice.create",
+      invoice: created.invoice,
+      bolt11: created.bolt11
+    });
+  });
+}
+
+async function handleWalletPayBolt11(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const invoice = requireOption(args, "invoice");
+  const sourceRef = getOptionalOption(args, "source-ref");
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const paid = await context.walletService.payInvoice({
+      invoice,
+      ...(sourceRef ? { sourceRef } : {})
+    });
+    writeJson(io, {
+      command: "wallet.pay.bolt11",
+      payment: paid.payment
+    });
+  });
+}
+
+async function handleWalletLedgerList(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const kindValue = getOptionalOption(args, "kind");
+  const status = getOptionalOption(args, "status");
+  const kind = kindValue ? parseEnum(kindValue, "--kind", ["invoice", "payment"] as const) : undefined;
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const filters = {
+      ...(kind ? { kind } : {}),
+      ...(status ? { status } : {})
+    };
+    writeJson(io, {
+      command: "wallet.ledger.list",
+      kind: kind ?? null,
+      status: status ?? null,
+      entries: await context.walletService.listLedger(filters)
+    });
+  });
+}
+
+async function handleWalletKeyRotate(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const newKey = requireOption(args, "new-key");
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    await context.walletService.rotateKey(newKey);
+    writeJson(io, {
+      command: "wallet.key.rotate",
+      rotated: true
+    });
+  });
+}
+
 function usage(): string {
   return [
     "Usage:",
     "  emporion agent init --data-dir <path> [--display-name <name>] [--bio <text>]",
     "  emporion agent show --data-dir <path>",
+    "  emporion wallet connect nwc --data-dir <path> --connection-uri <uri> [--publish-payment-endpoint]",
+    "  emporion wallet disconnect --data-dir <path>",
+    "  emporion wallet status --data-dir <path>",
+    "  emporion wallet invoice create --data-dir <path> --amount-sats <n> [--memo <text>] [--expires-at <iso>]",
+    "  emporion wallet pay bolt11 --data-dir <path> --invoice <bolt11>",
+    "  emporion wallet ledger list --data-dir <path> [--kind <invoice|payment>] [--status <status>]",
+    "  emporion wallet key rotate --data-dir <path> --new-key <key-material>",
     "  emporion agent payment-endpoint add --data-dir <path> --id <id> --capability <cap>[,<cap>...]",
     "  emporion agent wallet-attestation add --data-dir <path> --attestation-id <id> --wallet-account-id <id> --balance-sats <n> --expires-at <iso>",
     "  emporion agent feedback add --data-dir <path> --credential-id <id> --issuer-did <did> --contract-id <id> --agreement-id <id> --score <n> --max-score <n>",
@@ -2135,6 +2313,33 @@ function usage(): string {
 
 function getDataDirFromArgs(args: ParsedArgs): string | undefined {
   return getOptionalOption(args, "data-dir");
+}
+
+function withDaemonWalletKeyForwarding(args: ParsedArgs): ParsedArgs {
+  if (!isWalletCommand(args.commandPath)) {
+    return args;
+  }
+  if (getOptionalOption(args, "wallet-key")) {
+    return args;
+  }
+  const walletKey = process.env.EMPORION_WALLET_KEY;
+  if (!walletKey || walletKey.trim().length === 0) {
+    return args;
+  }
+
+  const options = new Map<string, string[]>(args.options);
+  options.set("wallet-key", [walletKey]);
+  return {
+    commandPath: [...args.commandPath],
+    options
+  };
+}
+
+function getDaemonProxyTimeoutMs(commandPath: string[]): number {
+  if (isWalletCommand(commandPath)) {
+    return WALLET_DAEMON_PROXY_TIMEOUT_MS;
+  }
+  return DEFAULT_DAEMON_PROXY_TIMEOUT_MS;
 }
 
 function createCaptureIo(): { stdout: string[]; stderr: string[]; io: CliIo } {
@@ -2291,7 +2496,8 @@ async function proxyParsedArgsToDaemon(args: ParsedArgs, io: CliIo): Promise<num
 
   const response = await sendDaemonCommand(
     dataDir,
-    daemonRequestFromParsed(args.commandPath, daemonRequestOptionsToRecord(args.options))
+    daemonRequestFromParsed(args.commandPath, daemonRequestOptionsToRecord(args.options)),
+    getDaemonProxyTimeoutMs(args.commandPath)
   );
   if (!response.ok) {
     throw new Error(response.error ?? "Daemon command failed");
@@ -2444,7 +2650,7 @@ async function handleDaemonLogs(args: ParsedArgs, io: CliIo): Promise<void> {
   }
 }
 
-async function buildDaemonSharedContext(dataDir: string, transport: AgentTransport): Promise<CliContext> {
+async function buildDaemonSharedContext(dataDir: string, transport: AgentTransport, walletService: WalletService): Promise<CliContext> {
   const identityMaterial = transport.getIdentityMaterial();
   const repository = await Protocol.ProtocolRepository.create(dataDir);
   return {
@@ -2452,6 +2658,7 @@ async function buildDaemonSharedContext(dataDir: string, transport: AgentTranspo
     identityMaterial,
     repository,
     transportStorage: transport.getStorage(),
+    walletService,
     signer: {
       did: identityMaterial.agentIdentity.did,
       publicKey: identityMaterial.transportKeyPair.publicKey,
@@ -2460,7 +2667,12 @@ async function buildDaemonSharedContext(dataDir: string, transport: AgentTranspo
   };
 }
 
-function buildDaemonStatus(dataDir: string, startedAt: string, transport: AgentTransport): DaemonStatus {
+function buildDaemonStatus(
+  dataDir: string,
+  startedAt: string,
+  transport: AgentTransport,
+  walletStatus: DaemonStatus["wallet"]
+): DaemonStatus {
   return {
     dataDir: normalizeDataDirPath(dataDir),
     pid: process.pid,
@@ -2470,8 +2682,64 @@ function buildDaemonStatus(dataDir: string, startedAt: string, transport: AgentT
     logPath: getDaemonLogPath(dataDir),
     topics: transport.getJoinedTopics(),
     connectedPeers: [...transport.getPeerSessions().values()],
+    wallet: walletStatus,
     healthy: true
   };
+}
+
+function collectAutoSettleCandidates(snapshot: {
+  offers: ReadonlyMap<string, Protocol.OfferState>;
+  bids: ReadonlyMap<string, Protocol.BidState>;
+  agreements: ReadonlyMap<string, Protocol.AgreementState>;
+}): AutoSettleCandidate[] {
+  const candidates: AutoSettleCandidate[] = [];
+
+  for (const offer of snapshot.offers.values()) {
+    if (offer.status !== "accepted") {
+      continue;
+    }
+    for (const lightningRef of offer.lightningRefs) {
+      candidates.push({
+        triggerObjectKind: "offer",
+        triggerObjectId: offer.objectId,
+        eventId: offer.latestEventId,
+        lightningRef,
+        amountSats: offer.paymentTerms.amountSats
+      });
+    }
+  }
+
+  for (const bid of snapshot.bids.values()) {
+    if (bid.status !== "accepted") {
+      continue;
+    }
+    for (const lightningRef of bid.lightningRefs) {
+      candidates.push({
+        triggerObjectKind: "bid",
+        triggerObjectId: bid.objectId,
+        eventId: bid.latestEventId,
+        lightningRef,
+        amountSats: bid.paymentTerms.amountSats
+      });
+    }
+  }
+
+  for (const agreement of snapshot.agreements.values()) {
+    if (agreement.status !== "active") {
+      continue;
+    }
+    for (const lightningRef of agreement.lightningRefs) {
+      candidates.push({
+        triggerObjectKind: "agreement",
+        triggerObjectId: agreement.objectId,
+        eventId: agreement.latestEventId,
+        lightningRef,
+        amountSats: agreement.paymentTerms.amountSats
+      });
+    }
+  }
+
+  return candidates;
 }
 
 async function runProtocolDiscoveryWatcher(
@@ -2508,62 +2776,122 @@ async function waitForProcessSignal(): Promise<void> {
 
 async function handleDaemonRun(args: ParsedArgs, io: CliIo): Promise<void> {
   const dataDir = requireOption(args, "data-dir");
-  const transport = await AgentTransport.create(buildTransportConfigFromArgs(args));
   const startup = getDaemonStartupOptions(args);
+  const walletService = await WalletService.create({
+    dataDir,
+    logger: createLogger("warn")
+  });
+  walletService.setRuntimeKey(process.env.EMPORION_WALLET_KEY ?? null);
+  let transport: AgentTransport | undefined;
   let sharedContext: CliContext | undefined;
   let daemon: AgentDaemon | undefined;
   let discoveryInterval: NodeJS.Timeout | undefined;
+  let walletPollInterval: NodeJS.Timeout | undefined;
+  let autoSettleInterval: NodeJS.Timeout | undefined;
+  let walletStatus: DaemonStatus["wallet"] = await walletService.daemonStatus();
+  let walletPollRunning = false;
+  let autoSettleRunning = false;
   const seenControlLengths = new Map<string, number>();
   const startedAt = new Date().toISOString();
 
   try {
+    transport = await AgentTransport.create(buildTransportConfigFromArgs(args));
     await transport.start();
-    sharedContext = await buildDaemonSharedContext(dataDir, transport);
+    const activeTransport = transport;
+    sharedContext = await buildDaemonSharedContext(dataDir, activeTransport, walletService);
 
-    const topics = buildTopicsFromArgs(args, transport.identity.did);
+    const topics = buildTopicsFromArgs(args, activeTransport.identity.did);
     startup.topics.push(...topics);
     for (const topic of startup.topics) {
-      await transport.joinTopic(topic);
+      await activeTransport.joinTopic(topic);
     }
     for (const did of startup.connectDids) {
-      await transport.connectToDid(did);
+      await activeTransport.connectToDid(did);
     }
     for (const publicKey of startup.connectNoiseKeys) {
-      await transport.connectToNoiseKey(publicKey);
+      await activeTransport.connectToNoiseKey(publicKey);
     }
 
     if (startup.watchProtocol) {
       discoveryInterval = setInterval(() => {
-        void runProtocolDiscoveryWatcher(transport, seenControlLengths, io).catch((error: unknown) => {
+        void runProtocolDiscoveryWatcher(activeTransport, seenControlLengths, io).catch((error: unknown) => {
           io.stderr(`${error instanceof Error ? error.message : String(error)}\n`);
         });
       }, 2_000);
     }
 
+    walletPollInterval = setInterval(() => {
+      if (walletPollRunning) {
+        return;
+      }
+      walletPollRunning = true;
+      void (async () => {
+        try {
+          await walletService.pollUpdates();
+          walletStatus = await walletService.daemonStatus();
+        } catch (error) {
+          io.stderr(`${error instanceof Error ? error.message : String(error)}\n`);
+        } finally {
+          walletPollRunning = false;
+        }
+      })();
+    }, 3_000);
+
+    autoSettleInterval = setInterval(() => {
+      if (autoSettleRunning || !sharedContext) {
+        return;
+      }
+      autoSettleRunning = true;
+      void (async () => {
+        try {
+          const candidates = collectAutoSettleCandidates(sharedContext.repository.getSnapshot());
+          for (const candidate of candidates) {
+            await walletService.attemptAutoSettle(candidate);
+          }
+          walletStatus = await walletService.daemonStatus();
+        } catch (error) {
+          io.stderr(`${error instanceof Error ? error.message : String(error)}\n`);
+        } finally {
+          autoSettleRunning = false;
+        }
+      })();
+    }, 2_000);
+
     daemon = new AgentDaemon({
       dataDir,
-      statusProvider: () => buildDaemonStatus(dataDir, startedAt, transport),
+      statusProvider: () => buildDaemonStatus(dataDir, startedAt, activeTransport, walletStatus),
       commandHandler: async (request: DaemonCommandRequest) => {
         if (!sharedContext) {
           throw new Error("Daemon context is not available");
         }
-        return CLI_CONTEXT_STORAGE.run(sharedContext, async () =>
+        const result = await CLI_CONTEXT_STORAGE.run(sharedContext, async () =>
           executeCapturedInDaemon({
             commandPath: request.commandPath,
             options: daemonOptionsRecordToMap(request.options)
           })
         );
+        walletStatus = await walletService.daemonStatus();
+        return result;
       },
       onShutdown: async () => {
         if (discoveryInterval) {
           clearInterval(discoveryInterval);
           discoveryInterval = undefined;
         }
+        if (walletPollInterval) {
+          clearInterval(walletPollInterval);
+          walletPollInterval = undefined;
+        }
+        if (autoSettleInterval) {
+          clearInterval(autoSettleInterval);
+          autoSettleInterval = undefined;
+        }
         if (sharedContext) {
           await sharedContext.repository.close();
           sharedContext = undefined;
         }
-        await transport.stop();
+        await walletService.close();
+        await activeTransport.stop();
       }
     });
 
@@ -2577,10 +2905,19 @@ async function handleDaemonRun(args: ParsedArgs, io: CliIo): Promise<void> {
       if (discoveryInterval) {
         clearInterval(discoveryInterval);
       }
+      if (walletPollInterval) {
+        clearInterval(walletPollInterval);
+      }
+      if (autoSettleInterval) {
+        clearInterval(autoSettleInterval);
+      }
       if (sharedContext) {
         await sharedContext.repository.close();
       }
-      await transport.stop();
+      await walletService.close();
+      if (transport) {
+        await transport.stop();
+      }
     }
   }
 }
@@ -2602,12 +2939,19 @@ async function executeParsedArgs(args: ParsedArgs, io: CliIo, options: DispatchO
     if (dataDir) {
       const activeDaemon = await probeDaemonStatus(dataDir, 1_000);
       if (activeDaemon) {
-        return proxyParsedArgsToDaemon(args, io);
+        return proxyParsedArgsToDaemon(withDaemonWalletKeyForwarding(args), io);
       }
     }
   }
 
   if (commandMatches(args.commandPath, "agent", "init")) return await handleAgentInit(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "wallet", "connect", "nwc")) return await handleWalletConnectNwc(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "wallet", "disconnect")) return await handleWalletDisconnect(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "wallet", "status")) return await handleWalletStatus(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "wallet", "invoice", "create")) return await handleWalletInvoiceCreate(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "wallet", "pay", "bolt11")) return await handleWalletPayBolt11(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "wallet", "ledger", "list")) return await handleWalletLedgerList(args, io).then(() => 0);
+  if (commandMatches(args.commandPath, "wallet", "key", "rotate")) return await handleWalletKeyRotate(args, io).then(() => 0);
   if (commandMatches(args.commandPath, "agent", "show")) return await handleAgentShow(args, io).then(() => 0);
   if (commandMatches(args.commandPath, "agent", "payment-endpoint", "add")) return await handleAgentPaymentEndpointAdd(args, io).then(() => 0);
   if (commandMatches(args.commandPath, "agent", "payment-endpoint", "remove")) return await handleAgentPaymentEndpointRemove(args, io).then(() => 0);

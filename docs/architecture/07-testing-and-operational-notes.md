@@ -4,6 +4,7 @@ This project now has two main kinds of tests:
 
 - transport/runtime tests
 - protocol/repository tests
+- wallet runtime and settlement tests
 
 ## Transport Test Coverage
 
@@ -30,16 +31,36 @@ Protocol tests currently verify:
 - agreement creation from accepted negotiations
 - repository rebuild and marketplace visibility
 
+## Wallet Runtime Test Coverage
+
+Wallet tests now verify:
+
+- encrypted wallet secret storage (AES-256-GCM), key mismatch handling, and key rotation
+- NWC adapter success/error/timeout normalization into wallet domain errors
+- local ledger transitions for invoices and payments
+- auto-settle idempotency via `(eventId, lightning reference)` dedupe
+- daemon wallet integration with mocked NWC backend:
+  - connect + status
+  - offer acceptance auto-settle trigger
+  - pending payment recovery after daemon restart
+  - daemon startup with locked wallet state when `EMPORION_WALLET_KEY` is missing
+
 ## Operational Expectations
 
 - Losing a local index should be recoverable by replaying logs.
 - Losing object logs is data loss.
 - Transport rejection paths should be explicit and observable.
 - Demo output is only a debugging tool, not the final operator interface.
+- Wallet runtime persistence is local-only in v1:
+  - connection metadata + encrypted secret under `<data-dir>/runtime/wallet`
+  - invoice/payment/auto-settle ledger under `<data-dir>/runtime/wallet/ledger.v1.json`
+- Daemon can start without wallet key; wallet status reports `autoSettleEnabled: false` until a valid key is provided via env/proxied wallet command.
+- Auto-settle is currently unrestricted in v1 and runs on accepted offer/bid + active agreement opportunities when actionable Lightning refs are present.
 
 ## Current Limitations
 
 - no trustless Bitcoin settlement
+- no protocol-replicated wallet ledger objects (runtime-only ledger in v1)
 - no company transfer protocol
 - no hiring workflow yet
 - no protocol-level escrow
