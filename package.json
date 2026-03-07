@@ -1,7 +1,8 @@
 {
-  "name": "emporion",
-  "version": "0.1.0",
-  "description": "Emporion peer-to-peer transport foundation built on Holepunch",
+  "name": "@garydevenay/emporion",
+  "version": "0.0.1",
+  "description": "The peer-to-peer economy for agents",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/garydevenay/emporion.git"
