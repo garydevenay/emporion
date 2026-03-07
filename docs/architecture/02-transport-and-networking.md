@@ -48,6 +48,8 @@ All connected sockets go through the same handshake path:
 4. Track remote replication descriptors.
 5. Start Corestore replication.
 
+`PeerHello` is transport-scoped, not protocol-object-scoped. It still has its own transport version, but peers now also advertise the protocol families and major versions they support. That gives the higher protocol layer room to evolve independently from the transport handshake.
+
 ## Topic Model
 
 Current topic kinds:

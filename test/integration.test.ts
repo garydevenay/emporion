@@ -9,6 +9,7 @@ import DHT from "hyperdht";
 import { performPeerHandshake } from "../src/handshake.js";
 import type { NoiseSocket } from "../src/handshake.js";
 import { loadIdentityMaterial } from "../src/identity.js";
+import { getSupportedProtocolDescriptors } from "../src/protocol/index.js";
 import { AgentTransport } from "../src/transport.js";
 import type { PeerHello } from "../src/types.js";
 import { createBootstrapNode, removeTempDir, waitFor } from "./helpers.js";
@@ -53,8 +54,13 @@ test("two agents discover each other, complete the handshake, and replicate the 
     });
 
     const feedKey = eventsFeedA.key.toString("hex");
+    const remoteEventsDescriptorOnB = [...agentB.getPeerSessions().values()][0]?.replication.find(
+      (descriptor) => descriptor.name === "events"
+    );
+    assert.ok(remoteEventsDescriptorOnB);
+    assert.equal(remoteEventsDescriptorOnB.key, feedKey);
     const remoteFeed = await waitFor(async () => {
-      const feed = agentB.getRemoteFeed(feedKey) ?? null;
+      const feed = agentB.getRemoteFeed(remoteEventsDescriptorOnB.key) ?? null;
       if (!feed) {
         return null;
       }
@@ -192,6 +198,7 @@ test("a direct connection is rejected when the DID document transport key does n
       protocolVersion: 1,
       agentDid: honestIdentity.agentIdentity.did,
       capabilities: ["emporion.transport.v1"],
+      supportedProtocols: getSupportedProtocolDescriptors(),
       controlFeedKey: honestIdentity.agentIdentity.controlFeedKey,
       joinedTopics: [],
       replication: []

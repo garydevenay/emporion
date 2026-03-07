@@ -1,8 +1,7 @@
 export {
-  EMPORION_PROTOCOL,
-  EMPORION_PROTOCOL_VERSION,
   createUnsignedEnvelope,
   deriveProtocolEventId,
+  resolveEnvelopeProtocolVersion,
   signProtocolEnvelope,
   validateEnvelopeShape,
   verifyProtocolEnvelopeSignature
@@ -10,12 +9,30 @@ export {
 export type {
   ProtocolAttachment,
   ProtocolEnvelope,
-  ProtocolObjectKind,
   ProtocolSignature,
   ProtocolSigner,
   ProtocolValidationResult,
+  ResolvedEnvelopeProtocolVersion,
   UnsignedProtocolEnvelope
 } from "./envelope.js";
+export {
+  LEGACY_EMPORION_PROTOCOL,
+  LEGACY_EMPORION_PROTOCOL_VERSION,
+  formatProtocolVersion,
+  getSupportedProtocolDescriptors,
+  isProtocolObjectKind,
+  isSupportedProtocolMajor,
+  latestProtocolVersionForFamily,
+  parseProtocolVersion,
+  protocolFamilyForObjectKind
+} from "./versioning.js";
+export type {
+  ProtocolFamily,
+  ProtocolObjectKind,
+  ProtocolVersion,
+  ProtocolVersionString,
+  SupportedProtocolDescriptor
+} from "./versioning.js";
 export {
   deriveCompanyDidFromGenesis,
   applyCompanyEvent

@@ -44,6 +44,8 @@ test("agent did:peer profile events validate and signatures verify", async () =>
 
     const shape = Protocol.validateEnvelopeShape(envelope);
     assert.equal(shape.ok, true);
+    assert.equal(envelope.protocol, "emporion.identity");
+    assert.equal(envelope.version, "1.0");
     await Protocol.verifyProtocolEnvelopeSignature(envelope);
     const state = Protocol.applyAgentProfileEvent(undefined, envelope);
     assert.equal(state.did, identity.agentIdentity.did);
@@ -431,7 +433,7 @@ test("market objects enforce valid transitions and agreement creation from accep
   assert.equal(agreement.status, "active");
 });
 
-test("protocol repository rebuilds state from logs, maintains marketplace visibility, and rejects unsupported versions", async () => {
+test("protocol repository rebuilds state, accepts legacy envelopes, and rejects unsupported versions", async () => {
   const protocolDir = await mkdtemp(path.join(os.tmpdir(), "emporion-protocol-repo-"));
   const signerDir = await createTempDir("emporion-protocol-repo-signer-");
 
@@ -492,12 +494,43 @@ test("protocol repository rebuilds state from logs, maintains marketplace visibi
     assert.ok(listingState && "status" in listingState);
     assert.equal(listingState.status, "withdrawn");
 
+    const legacyListing = Protocol.signProtocolEnvelope(
+      Protocol.createUnsignedEnvelope({
+        protocol: Protocol.LEGACY_EMPORION_PROTOCOL,
+        version: Protocol.LEGACY_EMPORION_PROTOCOL_VERSION,
+        objectKind: "listing",
+        objectId: "listing-legacy-1",
+        eventKind: "listing.published",
+        actorDid: identity.agentIdentity.did,
+        subjectId: "listing-legacy-1",
+        issuedAt: "2026-03-07T12:02:00.000Z",
+        payload: {
+          marketplaceId: "ops",
+          sellerDid: "did:emporion:company:company-a",
+          title: "Legacy listing",
+          paymentTerms: {
+            currency: "SAT",
+            amountSats: 2_000,
+            settlementMethod: "lightning"
+          }
+        }
+      }),
+      signer
+    );
+    await repository.appendEnvelope(legacyListing);
+    const legacyState = await repository.readObjectState("listing", "listing-legacy-1");
+    assert.ok(legacyState && "status" in legacyState);
+    assert.equal(legacyState.status, "open");
+
     const unsupportedVersion = {
       ...listingCreated,
       eventId: "bogus",
-      version: 2
+      version: "2.0"
     } as unknown as Protocol.ProtocolEnvelope;
-    await assert.rejects(() => repository.appendEnvelope(unsupportedVersion), /Unsupported protocol version|eventId does not match/i);
+    await assert.rejects(
+      () => repository.appendEnvelope(unsupportedVersion),
+      /Unsupported protocol version|eventId does not match|format/
+    );
 
     await repository.close();
   } finally {

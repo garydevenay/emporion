@@ -3,6 +3,7 @@ import { once } from "node:events";
 import type { Duplex } from "node:stream";
 
 import { HandshakeError } from "./errors.js";
+import type { SupportedProtocolDescriptor } from "./protocol/versioning.js";
 import type { PeerHello, ReplicationDescriptor } from "./types.js";
 
 export interface NoiseSocket extends Duplex {
@@ -20,6 +21,20 @@ function isValidReplicationDescriptor(value: unknown): value is ReplicationDescr
     typeof record.name === "string" &&
     /^[a-f0-9]{64}$/i.test(String(record.key)) &&
     (record.kind === "feed" || record.kind === "index")
+  );
+}
+
+function isValidSupportedProtocolDescriptor(value: unknown): value is SupportedProtocolDescriptor {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.protocol === "string" &&
+    Array.isArray(record.supportedMajorVersions) &&
+    record.supportedMajorVersions.every((entry) => Number.isInteger(entry) && Number(entry) > 0) &&
+    typeof record.latestVersion === "string"
   );
 }
 
@@ -41,6 +56,13 @@ export function validatePeerHello(value: unknown): PeerHello {
   if (!Array.isArray(record.capabilities) || record.capabilities.some((entry) => typeof entry !== "string")) {
     throw new HandshakeError("PeerHello.capabilities must be an array of strings");
   }
+  if (
+    record.supportedProtocols !== undefined &&
+    (!Array.isArray(record.supportedProtocols) ||
+      record.supportedProtocols.some((entry) => !isValidSupportedProtocolDescriptor(entry)))
+  ) {
+    throw new HandshakeError("PeerHello.supportedProtocols must be an array of supported protocol descriptors");
+  }
   if (!Array.isArray(record.joinedTopics) || record.joinedTopics.some((entry) => typeof entry !== "string")) {
     throw new HandshakeError("PeerHello.joinedTopics must be an array of strings");
   }
@@ -53,6 +75,7 @@ export function validatePeerHello(value: unknown): PeerHello {
     agentDid: record.agentDid,
     controlFeedKey: record.controlFeedKey,
     capabilities: [...record.capabilities],
+    supportedProtocols: [...((record.supportedProtocols as SupportedProtocolDescriptor[] | undefined) ?? [])],
     joinedTopics: [...record.joinedTopics],
     replication: [...record.replication]
   };

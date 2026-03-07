@@ -5,6 +5,19 @@ import { resolveDidDocument } from "../did.js";
 import { ProtocolValidationError } from "../errors.js";
 import type { DidDocumentLike } from "../types.js";
 import {
+  formatProtocolVersion,
+  isProtocolObjectKind,
+  isSupportedProtocolMajor,
+  latestProtocolVersionForFamily,
+  LEGACY_EMPORION_PROTOCOL,
+  LEGACY_EMPORION_PROTOCOL_VERSION,
+  parseProtocolVersion,
+  protocolFamilyForObjectKind,
+  type ProtocolFamily,
+  type ProtocolObjectKind,
+  type ProtocolVersionString
+} from "./versioning.js";
+import {
   assertIsoTimestamp,
   canonicalJsonStringify,
   decodeBase64Url,
@@ -13,27 +26,6 @@ import {
   type ProtocolJsonObject,
   type ProtocolValue
 } from "./shared.js";
-
-export const EMPORION_PROTOCOL = "emporion.protocol";
-export const EMPORION_PROTOCOL_VERSION = 1;
-
-export type ProtocolObjectKind =
-  | "agent-profile"
-  | "company"
-  | "product"
-  | "listing"
-  | "request"
-  | "offer"
-  | "bid"
-  | "agreement"
-  | "feedback-credential-ref"
-  | "contract"
-  | "evidence-bundle"
-  | "oracle-attestation"
-  | "dispute-case"
-  | "space"
-  | "space-membership"
-  | "message";
 
 export interface ProtocolAttachment {
   kind: string;
@@ -50,8 +42,8 @@ export interface ProtocolSignature {
 }
 
 export interface ProtocolEnvelope<TPayload extends ProtocolJsonObject = ProtocolJsonObject> {
-  protocol: typeof EMPORION_PROTOCOL;
-  version: typeof EMPORION_PROTOCOL_VERSION;
+  protocol: ProtocolFamily | typeof LEGACY_EMPORION_PROTOCOL;
+  version: ProtocolVersionString | typeof LEGACY_EMPORION_PROTOCOL_VERSION;
   objectKind: ProtocolObjectKind;
   objectId: string;
   eventKind: string;
@@ -92,6 +84,13 @@ export interface ProtocolSigner {
   did: string;
   publicKey: Uint8Array;
   secretKey: Uint8Array;
+}
+
+export interface ResolvedEnvelopeProtocolVersion {
+  family: ProtocolFamily;
+  major: number;
+  minor: number;
+  legacy: boolean;
 }
 
 function toUnsignedRecord(envelope: UnsignedProtocolEnvelope): ProtocolJsonObject {
@@ -174,6 +173,44 @@ export function deriveProtocolEventId(envelope: UnsignedProtocolEnvelope): strin
   return sha256Hex(toUnsignedRecord(envelope));
 }
 
+export function resolveEnvelopeProtocolVersion(envelope: {
+  protocol: ProtocolFamily | typeof LEGACY_EMPORION_PROTOCOL;
+  version: ProtocolVersionString | typeof LEGACY_EMPORION_PROTOCOL_VERSION;
+  objectKind: ProtocolObjectKind;
+}): ResolvedEnvelopeProtocolVersion {
+  if (envelope.protocol === LEGACY_EMPORION_PROTOCOL) {
+    if (envelope.version !== LEGACY_EMPORION_PROTOCOL_VERSION) {
+      throw new ProtocolValidationError(`Unsupported legacy protocol version: ${String(envelope.version)}`);
+    }
+
+    return {
+      family: protocolFamilyForObjectKind(envelope.objectKind),
+      major: 1,
+      minor: 0,
+      legacy: true
+    };
+  }
+
+  const family = protocolFamilyForObjectKind(envelope.objectKind);
+  if (envelope.protocol !== family) {
+    throw new ProtocolValidationError(
+      `Protocol ${envelope.protocol} does not match object kind ${envelope.objectKind}; expected ${family}`
+    );
+  }
+
+  const parsed = parseProtocolVersion(String(envelope.version));
+  if (!isSupportedProtocolMajor(family, parsed.major)) {
+    throw new ProtocolValidationError(`Unsupported protocol version for ${family}: ${envelope.version}`);
+  }
+
+  return {
+    family,
+    major: parsed.major,
+    minor: parsed.minor,
+    legacy: false
+  };
+}
+
 export function signProtocolEnvelope<TPayload extends ProtocolJsonObject>(
   envelope: UnsignedProtocolEnvelope<TPayload>,
   signer: ProtocolSigner
@@ -209,14 +246,20 @@ export function signProtocolEnvelope<TPayload extends ProtocolJsonObject>(
 export function validateEnvelopeShape(envelope: ProtocolEnvelope): ProtocolValidationResult {
   const issues: ProtocolValidationIssue[] = [];
 
-  if (envelope.protocol !== EMPORION_PROTOCOL) {
-    issues.push({ code: "invalid-protocol", message: `Unsupported protocol: ${envelope.protocol}` });
-  }
-  if (envelope.version !== EMPORION_PROTOCOL_VERSION) {
-    issues.push({ code: "unsupported-version", message: `Unsupported protocol version: ${envelope.version}` });
-  }
-  if (!envelope.objectKind) {
-    issues.push({ code: "invalid-object-kind", message: "objectKind is required" });
+  if (!isProtocolObjectKind(envelope.objectKind)) {
+    issues.push({ code: "invalid-object-kind", message: `Unsupported objectKind: ${String(envelope.objectKind)}` });
+  } else {
+    try {
+      resolveEnvelopeProtocolVersion(envelope);
+    } catch (error) {
+      const message = (error as Error).message;
+      issues.push({
+        code: /does not match object kind|Unsupported protocol:|Protocol /.test(message)
+          ? "invalid-protocol"
+          : "unsupported-version",
+        message
+      });
+    }
   }
   try {
     assertIsoTimestamp(envelope.issuedAt, "ProtocolEnvelope.issuedAt");
@@ -269,10 +312,18 @@ export function createUnsignedEnvelope<TPayload extends ProtocolJsonObject>(inpu
   previousEventIds?: string[];
   payload: TPayload;
   attachments?: ProtocolAttachment[];
+  protocol?: ProtocolFamily | typeof LEGACY_EMPORION_PROTOCOL;
+  version?: ProtocolVersionString | typeof LEGACY_EMPORION_PROTOCOL_VERSION;
 }): UnsignedProtocolEnvelope<TPayload> {
+  const protocol = input.protocol ?? protocolFamilyForObjectKind(input.objectKind);
+  const version =
+    input.version ??
+    (protocol === LEGACY_EMPORION_PROTOCOL
+      ? LEGACY_EMPORION_PROTOCOL_VERSION
+      : formatProtocolVersion(latestProtocolVersionForFamily(protocol)));
   return {
-    protocol: EMPORION_PROTOCOL,
-    version: EMPORION_PROTOCOL_VERSION,
+    protocol,
+    version,
     objectKind: input.objectKind,
     objectId: input.objectId,
     eventKind: input.eventKind,

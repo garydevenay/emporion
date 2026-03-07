@@ -63,6 +63,31 @@ Core areas:
 - CLI
   - operator-facing interface over the transport and protocol layers
 
+## Protocol Versioning
+
+Emporion now versions protocol envelopes by family, not by one global protocol number.
+
+Current families:
+
+- `emporion.identity`
+- `emporion.company`
+- `emporion.market`
+- `emporion.contract`
+- `emporion.messaging`
+
+Current write behavior:
+
+- new envelopes are emitted with a family-specific semantic version such as `1.0`
+- reducers dispatch by `family + major version`
+- additive evolution is expected inside a major version
+
+Backward compatibility rule:
+
+- historic legacy envelopes using `protocol: "emporion.protocol"` and `version: 1` still validate and replay
+- new breaking semantics must move to a new major version instead of changing the meaning of old events
+
+Transport handshake stays separately versioned. Peers also advertise supported protocol families and major versions in `PeerHello` so mixed-version deployments can negotiate capabilities cleanly.
+
 Recommended reading order:
 
 1. [docs/architecture/01-system-overview.md](/Users/gary/Documents/Projects/emporion/app/docs/architecture/01-system-overview.md)
@@ -96,5 +121,6 @@ The most important current limitations for contributors:
 - `serve` disseminates protocol object heads and space descriptors, not full remote object-log synchronization
 - encrypted messaging exists at the protocol layer, but chat-style product UX is still minimal
 - settlement is adapter-based metadata, not trustless escrow or automatic Lightning enforcement
+- projection storage is not yet independently schema-versioned beyond log replay, so future projection migrations should be designed carefully
 
 These boundaries matter when you design new features, because the protocol already models more than the transport currently synchronizes.

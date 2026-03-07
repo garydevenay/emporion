@@ -11,6 +11,7 @@ import { performPeerHandshake } from "./handshake.js";
 import type { NoiseSocket } from "./handshake.js";
 import { loadIdentityMaterial, persistAgentIdentity, type IdentityMaterial } from "./identity.js";
 import { createLogger, type Logger } from "./logger.js";
+import { getSupportedProtocolDescriptors } from "./protocol/versioning.js";
 import { TransportStorage } from "./storage.js";
 import { topicRefToCanonicalString, topicRefToDiscoveryKey } from "./topics.js";
 import type {
@@ -28,6 +29,7 @@ export interface PeerSession {
   remoteNoisePublicKey: string;
   remoteControlFeedKey: string;
   source: string;
+  supportedProtocols: PeerHello["supportedProtocols"];
   replication: ReplicationDescriptor[];
 }
 
@@ -331,6 +333,7 @@ export class AgentTransport {
       protocolVersion: 1,
       agentDid: this.identity.did,
       capabilities: ["emporion.transport.v1", "hypercore.replicate"],
+      supportedProtocols: getSupportedProtocolDescriptors(),
       controlFeedKey: this.identity.controlFeedKey,
       joinedTopics: [...this.joinedTopics.values()].map(({ ref }) => topicRefToCanonicalString(ref)).sort(),
       replication: this.storage.getReplicationDescriptors()
@@ -363,6 +366,7 @@ export class AgentTransport {
       remoteNoisePublicKey,
       remoteControlFeedKey: remoteHello.controlFeedKey,
       source,
+      supportedProtocols: remoteHello.supportedProtocols,
       replication: remoteHello.replication
     };
   }

@@ -1,4 +1,5 @@
 import type { LogLevel } from "./logger.js";
+import type { SupportedProtocolDescriptor } from "./protocol/versioning.js";
 
 export interface ReconnectBackoffConfig {
   minMs: number;
@@ -64,6 +65,7 @@ export interface PeerHello {
   protocolVersion: 1;
   agentDid: string;
   capabilities: string[];
+  supportedProtocols: SupportedProtocolDescriptor[];
   controlFeedKey: string;
   joinedTopics: string[];
   replication: ReplicationDescriptor[];

@@ -15,8 +15,8 @@ Emporion Protocol v1 standardizes signed, append-only economic objects on top of
 
 Every object event uses the canonical envelope exported from `src/protocol/envelope.ts`:
 
-- `protocol`: `emporion.protocol`
-- `version`: `1`
+- `protocol`: family-scoped, for example `emporion.market` or `emporion.contract`
+- `version`: semantic major/minor, for example `1.0`
 - `objectKind`
 - `objectId`
 - `eventKind`
@@ -30,6 +30,25 @@ Every object event uses the canonical envelope exported from `src/protocol/envel
 - `signature`
 
 `eventId` is a canonical content hash over the unsigned envelope, and the signature covers the canonical envelope plus `eventId`.
+
+## Versioning Model
+
+Protocol versioning is family-scoped.
+
+Current families:
+
+- `emporion.identity`
+- `emporion.company`
+- `emporion.market`
+- `emporion.contract`
+- `emporion.messaging`
+
+Compatibility rules:
+
+- old legacy envelopes using `protocol: "emporion.protocol"` and `version: 1` are still accepted for replay
+- new writes use family-scoped semantic versions
+- reducers route by family plus major version
+- breaking semantic changes must move to a new major version instead of changing the meaning of old events
 
 ## Identity
 
@@ -158,7 +177,7 @@ The protocol layer now emits discoverability records over the transport control 
 - `protocol-object-head` announcements for protocol objects
 - `space-descriptor` announcements for room and thread discovery
 
-These records advertise object identity, latest head, ownership, and status without exposing encrypted content.
+These records advertise object identity, latest head, ownership, status, and protocol version metadata without exposing encrypted content.
 
 ## Repository and Indexes
 

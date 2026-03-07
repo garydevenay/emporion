@@ -14,7 +14,11 @@ import {
   applyFeedbackCredentialRefEvent,
   type FeedbackCredentialRefState
 } from "./credential-reference.js";
-import { verifyProtocolEnvelopeSignature, type ProtocolEnvelope } from "./envelope.js";
+import {
+  resolveEnvelopeProtocolVersion,
+  verifyProtocolEnvelopeSignature,
+  type ProtocolEnvelope
+} from "./envelope.js";
 import { applyAgentProfileEvent, type AgentProfileState } from "./identity.js";
 import {
   applyAgreementEvent,
@@ -67,6 +71,8 @@ type ObjectState =
   | MessageState;
 
 interface ObjectCatalogRecord {
+  protocol: ProtocolEnvelope["protocol"];
+  version: ProtocolEnvelope["version"];
   objectKind: ProtocolEnvelope["objectKind"];
   objectId: string;
   feedName: string;
@@ -274,6 +280,8 @@ export class ProtocolRepository {
     await feed.append(envelope as unknown as ProtocolJsonObject);
 
     const catalogRecord: ObjectCatalogRecord = {
+      protocol: envelope.protocol,
+      version: envelope.version,
       objectKind: envelope.objectKind,
       objectId: envelope.objectId,
       feedName: feedNameForEnvelope(envelope),
@@ -688,132 +696,162 @@ export class ProtocolRepository {
   }
 
   private applyToSnapshot(envelope: ProtocolEnvelope, target = this.snapshot): ObjectState {
-    switch (envelope.objectKind) {
-      case "agent-profile": {
-        const current = target.agentProfiles.get(envelope.objectId);
-        const next = applyAgentProfileEvent(current, envelope);
-        target.agentProfiles.set(envelope.objectId, next);
-        return next;
-      }
-      case "company": {
-        const current = target.companies.get(envelope.objectId);
-        const next = applyCompanyEvent(current, envelope);
-        target.companies.set(envelope.objectId, next);
-        return next;
-      }
-      case "product": {
-        const current = target.products.get(envelope.objectId);
-        const next = applyProductEvent(current, envelope);
-        target.products.set(envelope.objectId, next);
-        return next;
-      }
-      case "listing": {
-        const current = target.listings.get(envelope.objectId);
-        const next = applyListingEvent(current, envelope);
-        target.listings.set(envelope.objectId, next);
-        return next;
-      }
-      case "request": {
-        const current = target.requests.get(envelope.objectId);
-        const next = applyRequestEvent(current, envelope);
-        target.requests.set(envelope.objectId, next);
-        return next;
-      }
-      case "offer": {
-        const current = target.offers.get(envelope.objectId);
-        const next = applyOfferEvent(current, envelope);
-        target.offers.set(envelope.objectId, next);
-        return next;
-      }
-      case "bid": {
-        const current = target.bids.get(envelope.objectId);
-        const next = applyBidEvent(current, envelope);
-        target.bids.set(envelope.objectId, next);
-        return next;
-      }
-      case "agreement": {
-        const current = target.agreements.get(envelope.objectId);
-        const next = applyAgreementEvent(current, envelope, {
-          offerStates: target.offers,
-          bidStates: target.bids,
-          listingStates: target.listings,
-          requestStates: target.requests
-        });
-        target.agreements.set(envelope.objectId, next);
-        return next;
-      }
-      case "feedback-credential-ref": {
-        const current = target.feedbackCredentialRefs.get(envelope.objectId);
-        const next = applyFeedbackCredentialRefEvent(current, envelope);
-        target.feedbackCredentialRefs.set(envelope.objectId, next);
-        return next;
-      }
-      case "contract": {
-        const current = target.contracts.get(envelope.objectId);
-        const next = applyContractEvent(current, envelope, {
-          agreements: target.agreements,
-          listings: target.listings,
-          requests: target.requests,
-          offers: target.offers,
-          bids: target.bids
-        });
-        target.contracts.set(envelope.objectId, next);
-        return next;
-      }
-      case "evidence-bundle": {
-        const current = target.evidenceBundles.get(envelope.objectId);
-        const next = applyEvidenceBundleEvent(current, envelope, {
-          contracts: target.contracts
-        });
-        target.evidenceBundles.set(envelope.objectId, next);
-        return next;
-      }
-      case "oracle-attestation": {
-        const current = target.oracleAttestations.get(envelope.objectId);
-        const next = applyOracleAttestationEvent(current, envelope, {
-          contracts: target.contracts,
-          evidenceBundles: target.evidenceBundles,
-          disputes: target.disputes
-        });
-        target.oracleAttestations.set(envelope.objectId, next);
-        return next;
-      }
-      case "dispute-case": {
-        const current = target.disputes.get(envelope.objectId);
-        const next = applyDisputeCaseEvent(current, envelope, {
-          contracts: target.contracts,
-          evidenceBundles: target.evidenceBundles,
-          oracleAttestations: target.oracleAttestations
-        });
-        target.disputes.set(envelope.objectId, next);
-        return next;
-      }
-      case "space": {
-        const current = target.spaces.get(envelope.objectId);
-        const next = applySpaceEvent(current, envelope);
-        target.spaces.set(envelope.objectId, next);
-        return next;
-      }
-      case "space-membership": {
-        const current = target.spaceMemberships.get(envelope.objectId);
-        const next = applySpaceMembershipEvent(current, envelope, {
-          spaces: target.spaces,
-          memberships: target.spaceMemberships
-        });
-        target.spaceMemberships.set(envelope.objectId, next);
-        return next;
-      }
-      case "message": {
-        const current = target.messages.get(envelope.objectId);
-        const next = applyMessageEvent(current, envelope, {
-          spaces: target.spaces,
-          memberships: target.spaceMemberships
-        });
-        target.messages.set(envelope.objectId, next);
-        return next;
-      }
-      default:
-        throw new ProtocolValidationError(`Unsupported protocol object kind: ${(envelope as { objectKind: string }).objectKind}`);
+    const resolvedVersion = resolveEnvelopeProtocolVersion(envelope);
+
+    switch (`${resolvedVersion.family}@${resolvedVersion.major}`) {
+      case "emporion.identity@1":
+        switch (envelope.objectKind) {
+          case "agent-profile": {
+            const current = target.agentProfiles.get(envelope.objectId);
+            const next = applyAgentProfileEvent(current, envelope);
+            target.agentProfiles.set(envelope.objectId, next);
+            return next;
+          }
+          case "feedback-credential-ref": {
+            const current = target.feedbackCredentialRefs.get(envelope.objectId);
+            const next = applyFeedbackCredentialRefEvent(current, envelope);
+            target.feedbackCredentialRefs.set(envelope.objectId, next);
+            return next;
+          }
+          default:
+            break;
+        }
+        break;
+      case "emporion.company@1":
+        if (envelope.objectKind === "company") {
+          const current = target.companies.get(envelope.objectId);
+          const next = applyCompanyEvent(current, envelope);
+          target.companies.set(envelope.objectId, next);
+          return next;
+        }
+        break;
+      case "emporion.market@1":
+        switch (envelope.objectKind) {
+          case "product": {
+            const current = target.products.get(envelope.objectId);
+            const next = applyProductEvent(current, envelope);
+            target.products.set(envelope.objectId, next);
+            return next;
+          }
+          case "listing": {
+            const current = target.listings.get(envelope.objectId);
+            const next = applyListingEvent(current, envelope);
+            target.listings.set(envelope.objectId, next);
+            return next;
+          }
+          case "request": {
+            const current = target.requests.get(envelope.objectId);
+            const next = applyRequestEvent(current, envelope);
+            target.requests.set(envelope.objectId, next);
+            return next;
+          }
+          case "offer": {
+            const current = target.offers.get(envelope.objectId);
+            const next = applyOfferEvent(current, envelope);
+            target.offers.set(envelope.objectId, next);
+            return next;
+          }
+          case "bid": {
+            const current = target.bids.get(envelope.objectId);
+            const next = applyBidEvent(current, envelope);
+            target.bids.set(envelope.objectId, next);
+            return next;
+          }
+          case "agreement": {
+            const current = target.agreements.get(envelope.objectId);
+            const next = applyAgreementEvent(current, envelope, {
+              offerStates: target.offers,
+              bidStates: target.bids,
+              listingStates: target.listings,
+              requestStates: target.requests
+            });
+            target.agreements.set(envelope.objectId, next);
+            return next;
+          }
+          default:
+            break;
+        }
+        break;
+      case "emporion.contract@1":
+        switch (envelope.objectKind) {
+          case "contract": {
+            const current = target.contracts.get(envelope.objectId);
+            const next = applyContractEvent(current, envelope, {
+              agreements: target.agreements,
+              listings: target.listings,
+              requests: target.requests,
+              offers: target.offers,
+              bids: target.bids
+            });
+            target.contracts.set(envelope.objectId, next);
+            return next;
+          }
+          case "evidence-bundle": {
+            const current = target.evidenceBundles.get(envelope.objectId);
+            const next = applyEvidenceBundleEvent(current, envelope, {
+              contracts: target.contracts
+            });
+            target.evidenceBundles.set(envelope.objectId, next);
+            return next;
+          }
+          case "oracle-attestation": {
+            const current = target.oracleAttestations.get(envelope.objectId);
+            const next = applyOracleAttestationEvent(current, envelope, {
+              contracts: target.contracts,
+              evidenceBundles: target.evidenceBundles,
+              disputes: target.disputes
+            });
+            target.oracleAttestations.set(envelope.objectId, next);
+            return next;
+          }
+          case "dispute-case": {
+            const current = target.disputes.get(envelope.objectId);
+            const next = applyDisputeCaseEvent(current, envelope, {
+              contracts: target.contracts,
+              evidenceBundles: target.evidenceBundles,
+              oracleAttestations: target.oracleAttestations
+            });
+            target.disputes.set(envelope.objectId, next);
+            return next;
+          }
+          default:
+            break;
+        }
+        break;
+      case "emporion.messaging@1":
+        switch (envelope.objectKind) {
+          case "space": {
+            const current = target.spaces.get(envelope.objectId);
+            const next = applySpaceEvent(current, envelope);
+            target.spaces.set(envelope.objectId, next);
+            return next;
+          }
+          case "space-membership": {
+            const current = target.spaceMemberships.get(envelope.objectId);
+            const next = applySpaceMembershipEvent(current, envelope, {
+              spaces: target.spaces,
+              memberships: target.spaceMemberships
+            });
+            target.spaceMemberships.set(envelope.objectId, next);
+            return next;
+          }
+          case "message": {
+            const current = target.messages.get(envelope.objectId);
+            const next = applyMessageEvent(current, envelope, {
+              spaces: target.spaces,
+              memberships: target.spaceMemberships
+            });
+            target.messages.set(envelope.objectId, next);
+            return next;
+          }
+          default:
+            break;
+        }
+        break;
     }
+
+    throw new ProtocolValidationError(
+      `Unsupported protocol/object reducer route: ${envelope.protocol}@${String(envelope.version)} ${envelope.objectKind}`
+    );
   }
 }

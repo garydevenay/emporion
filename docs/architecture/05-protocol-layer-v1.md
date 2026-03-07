@@ -22,6 +22,20 @@ Core fields:
 - `attachments`
 - `signature`
 
+## Versioning
+
+The protocol layer is no longer modeled as one globally versioned schema.
+
+Instead:
+
+- each object kind belongs to a protocol family
+- each family carries its own semantic version
+- reducers are selected by family plus major version
+
+That lets Emporion evolve market, contract, and messaging semantics independently while keeping old logs replayable.
+
+Legacy compatibility is preserved for historic envelopes written with `protocol: "emporion.protocol"` and `version: 1`.
+
 ## Event Identity
 
 - `eventId` is a canonical content hash of the unsigned envelope

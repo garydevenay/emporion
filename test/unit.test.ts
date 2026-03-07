@@ -6,6 +6,7 @@ import { normalizeTransportConfig } from "../src/config.js";
 import { createPeerDid, extractEmporionTransportService, resolveDidDocument } from "../src/did.js";
 import { loadIdentityMaterial } from "../src/identity.js";
 import { performPeerHandshake } from "../src/handshake.js";
+import { getSupportedProtocolDescriptors } from "../src/protocol/index.js";
 import { topicRefToCanonicalString, topicRefToDiscoveryKey } from "../src/topics.js";
 import type { PeerHello } from "../src/types.js";
 import { createTempDir, removeTempDir } from "./helpers.js";
@@ -60,6 +61,7 @@ test("performPeerHandshake exchanges and validates framed hello payloads", async
     protocolVersion: 1,
     agentDid: "did:peer:2.left",
     capabilities: ["left"],
+    supportedProtocols: getSupportedProtocolDescriptors(),
     controlFeedKey: "11".repeat(32),
     joinedTopics: ["marketplace:coding"],
     replication: []
@@ -68,6 +70,7 @@ test("performPeerHandshake exchanges and validates framed hello payloads", async
     protocolVersion: 1,
     agentDid: "did:peer:2.right",
     capabilities: ["right"],
+    supportedProtocols: getSupportedProtocolDescriptors(),
     controlFeedKey: "22".repeat(32),
     joinedTopics: ["company:emporion"],
     replication: []
@@ -88,6 +91,7 @@ test("performPeerHandshake times out when the remote peer stays silent", async (
     protocolVersion: 1,
     agentDid: "did:peer:2.left",
     capabilities: ["left"],
+    supportedProtocols: getSupportedProtocolDescriptors(),
     controlFeedKey: "11".repeat(32),
     joinedTopics: [],
     replication: []

@@ -1,4 +1,4 @@
-import type { ProtocolEnvelope, ProtocolObjectKind } from "./envelope.js";
+import type { ProtocolEnvelope } from "./envelope.js";
 import type { ContractState } from "./contracts.js";
 import type { CompanyState } from "./company.js";
 import type { AgentProfileState } from "./identity.js";
@@ -7,6 +7,7 @@ import type { DisputeCaseState, EvidenceBundleState, OracleAttestationState } fr
 import type { FeedbackCredentialRefState } from "./credential-reference.js";
 import type { MessageState, SpaceMembershipState, SpaceState } from "./messaging.js";
 import type { ProtocolJsonObject } from "./shared.js";
+import type { ProtocolFamily, ProtocolObjectKind, ProtocolVersionString } from "./versioning.js";
 
 export type DisseminationState =
   | AgentProfileState
@@ -28,6 +29,8 @@ export type DisseminationState =
 
 export interface ProtocolObjectHeadAnnouncement {
   kind: "protocol-object-head";
+  protocol?: ProtocolFamily | "emporion.protocol";
+  version?: ProtocolVersionString | 1;
   objectKind: ProtocolObjectKind;
   objectId: string;
   headEventId: string;
@@ -43,6 +46,8 @@ export interface ProtocolObjectHeadAnnouncement {
 
 export interface SpaceDescriptorAnnouncement {
   kind: "space-descriptor";
+  protocol?: ProtocolFamily | "emporion.protocol";
+  version?: ProtocolVersionString | 1;
   objectKind: "space";
   objectId: string;
   headEventId: string;
@@ -110,6 +115,8 @@ export function createProtocolAnnouncement(
     const spaceState = state as SpaceState;
     return {
       kind: "space-descriptor",
+      protocol: envelope.protocol,
+      version: envelope.version,
       objectKind: "space",
       objectId: envelope.objectId,
       headEventId: envelope.eventId,
@@ -126,6 +133,8 @@ export function createProtocolAnnouncement(
 
   const announcement: ProtocolObjectHeadAnnouncement = {
     kind: "protocol-object-head",
+    protocol: envelope.protocol,
+    version: envelope.version,
     objectKind: envelope.objectKind,
     objectId: envelope.objectId,
     headEventId: envelope.eventId,
@@ -163,6 +172,8 @@ export function isProtocolAnnouncement(value: unknown): value is ProtocolAnnounc
   const candidate = value as Partial<ProtocolAnnouncement>;
   return (
     (candidate.kind === "protocol-object-head" || candidate.kind === "space-descriptor") &&
+    (candidate.protocol === undefined || typeof candidate.protocol === "string") &&
+    (candidate.version === undefined || typeof candidate.version === "string" || typeof candidate.version === "number") &&
     typeof candidate.objectKind === "string" &&
     typeof candidate.objectId === "string" &&
     typeof candidate.headEventId === "string" &&
