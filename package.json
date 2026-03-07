@@ -1,5 +1,5 @@
 {
-  "name": "emporion-transport",
+  "name": "emporion",
   "version": "0.1.0",
   "description": "Emporion peer-to-peer transport foundation built on Holepunch",
   "repository": {
