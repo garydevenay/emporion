@@ -1,0 +1,47 @@
+{
+  "name": "emporion-transport",
+  "version": "0.1.0",
+  "description": "Emporion peer-to-peer transport foundation built on Holepunch",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "emporion": "./dist/src/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "cli": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/**/*.test.ts",
+    "demo": "tsx src/demo.ts"
+  },
+  "engines": {
+    "node": ">=25.0.0"
+  },
+  "dependencies": {
+    "bs58": "^6.0.0",
+    "corestore": "^7.9.0",
+    "did-resolver": "^4.1.0",
+    "hyperbee": "^2.27.3",
+    "hypercore": "^11.27.7",
+    "hyperdht": "^6.29.1",
+    "hyperswarm": "^4.17.0",
+    "key-did-resolver": "^4.0.0",
+    "peer-did-resolver": "^2.0.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
