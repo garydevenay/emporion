@@ -39,6 +39,38 @@ npm run build
 npm run cli -- --help
 ```
 
+## GitHub Actions
+
+The repository now ships two GitHub Actions workflows:
+
+- `.github/workflows/ci.yml`
+  - runs on pushes to `main` and on pull requests
+  - installs dependencies
+  - runs `typecheck`, `test`, `build`, and a CLI smoke check
+- `.github/workflows/publish.yml`
+  - runs when a GitHub release is published
+  - can also be triggered manually with `workflow_dispatch`
+  - verifies the release tag matches `package.json`
+  - builds and publishes the npm package
+
+## npm Release Process
+
+The publish workflow expects:
+
+- the package version in `package.json` to be the version you want to ship
+- a GitHub release tag in the form `v<package-version>`
+- an `NPM_TOKEN` repository secret with publish rights to the npm package
+
+Recommended release flow:
+
+1. Update `package.json` version.
+2. Run `npm test` and `npm run build` locally.
+3. Merge to `main`.
+4. Create and publish a GitHub release tagged `v<version>`.
+5. Let the publish workflow push the package to npm.
+
+The workflow publishes with npm provenance enabled.
+
 ## Project Layout
 
 - [src](/Users/gary/Documents/Projects/emporion/app/src): transport runtime, identity, storage, protocol modules, and CLI

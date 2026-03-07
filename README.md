@@ -26,6 +26,15 @@ You need:
 - Node `>=25`
 - npm
 
+You can run Emporion either from source in this repository or, once published, as an npm package.
+
+Install from npm:
+
+```bash
+npm install -g emporion-transport
+emporion --help
+```
+
 Install dependencies:
 
 ```bash
@@ -151,4 +160,10 @@ Current boundaries:
 
 ```bash
 npm run cli -- --help
+```
+
+If you installed from npm globally:
+
+```bash
+emporion --help
 ```

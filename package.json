@@ -2,6 +2,14 @@
   "name": "emporion-transport",
   "version": "0.1.0",
   "description": "Emporion peer-to-peer transport foundation built on Holepunch",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/garydevenay/emporion.git"
+  },
+  "homepage": "https://github.com/garydevenay/emporion#readme",
+  "bugs": {
+    "url": "https://github.com/garydevenay/emporion/issues"
+  },
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -17,12 +25,16 @@
   "files": [
     "dist"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "cli": "tsx src/cli.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/**/*.test.ts",
-    "demo": "tsx src/demo.ts"
+    "demo": "tsx src/demo.ts",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=25.0.0"
