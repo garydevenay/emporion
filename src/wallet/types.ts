@@ -2,8 +2,8 @@ import type { LightningReference } from "../protocol/index.js";
 
 export const EMPORION_WALLET_KEY_ENV = "EMPORION_WALLET_KEY";
 
-export type WalletBackend = "nwc";
-export type WalletNetwork = "bitcoin";
+export type WalletBackend = "nwc" | "circle";
+export type WalletNetwork = "bitcoin" | "offchain";
 
 export interface WalletConnectionConfig {
   backend: WalletBackend;

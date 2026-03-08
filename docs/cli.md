@@ -432,9 +432,12 @@ How to use it:
 
 ## Wallet Commands
 
-Wallet commands operate on a local daemon/runtime wallet model. v1 uses an NWC backend and persists ledger records locally only.
+Wallet commands operate on a local daemon/runtime wallet model. Current backends:
 
-Circle/x402 nanopayment support is currently on the design track (not yet implemented in CLI commands). See [Circle Nanopayments Adapter (Design)](./architecture/09-circle-nanopayments-adapter.md).
+- `nwc` for Lightning invoice/create/pay flows
+- `circle` for x402 nanopayment pay flows
+
+Circle integration design details and rollout plan are documented in [Circle Nanopayments Adapter (Design)](./architecture/09-circle-nanopayments-adapter.md).
 
 ### `wallet connect nwc`
 
@@ -483,6 +486,29 @@ Response payload:
   "endpoint": "https://wallet.example/rpc"
 }
 ```
+
+### `wallet connect circle`
+
+Purpose: connect a Circle/x402 payment backend and persist encrypted connection metadata under `<data-dir>/runtime/wallet`.
+
+Usage:
+
+```bash
+EMPORION_WALLET_KEY="your-unlock-key" emporion wallet connect circle \
+  --data-dir ./tmp/agent-a \
+  --connection-uri 'circle+https://api.circle.com?api-key=<token>&payments-path=/v1/nanopayments/payments'
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--connection-uri <circle+http(s)://...>`
+- optional: `--wallet-key <key>` (useful when running through an already-running daemon)
+
+Notes:
+
+- `--publish-payment-endpoint` is currently only supported on `wallet connect nwc`
+- circle connections report wallet network as `offchain`
 
 ### `wallet disconnect`
 
@@ -572,6 +598,32 @@ EMPORION_WALLET_KEY="your-unlock-key" emporion wallet pay bolt11 \
   --data-dir ./tmp/agent-a \
   --invoice lnbc...
 ```
+
+This command is for Lightning backends. When the active backend is `circle`, use `wallet pay x402`.
+
+### `wallet pay x402`
+
+Purpose: submit an x402/Circle payment request through the connected Circle backend and persist a local payment record.
+
+Usage:
+
+```bash
+EMPORION_WALLET_KEY="your-unlock-key" emporion wallet pay x402 \
+  --data-dir ./tmp/agent-a \
+  --resource https://merchant.example/protected-resource
+```
+
+Request options:
+
+- required: `--data-dir`
+- required: `--resource <url-or-json>`
+- optional: `--source-ref <text>`
+
+Behavior:
+
+- requires a connected `circle` wallet backend
+- if `--resource` is JSON, it is passed through as provider payload
+- response command is `wallet.pay.x402`
 
 ### `wallet ledger list`
 

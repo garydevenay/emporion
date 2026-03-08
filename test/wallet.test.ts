@@ -9,6 +9,10 @@ import test from "node:test";
 import { runCli } from "../src/cli.js";
 import { WalletAuthError, WalletUnavailableError } from "../src/errors.js";
 import { WalletConfigStore } from "../src/wallet/config-store.js";
+import {
+  CircleX402WalletAdapter,
+  parseCircleConnectionMetadata
+} from "../src/wallet/circle-x402-adapter.js";
 import { NwcWalletAdapter } from "../src/wallet/nwc-adapter.js";
 import {
   NostrWalletConnectAdapter,
@@ -278,6 +282,113 @@ async function createMockNwcServer(options?: {
   };
 }
 
+async function createMockCircleServer(options?: {
+  requireToken?: string;
+  createPaymentDelayMs?: number;
+}): Promise<{
+  connectionUri: string;
+  state: {
+    createPaymentCalls: number;
+    statusCalls: number;
+  };
+  close(): Promise<void>;
+}> {
+  const state = {
+    createPaymentCalls: 0,
+    statusCalls: 0
+  };
+
+  const server = http.createServer((req, res) => {
+    const expectedToken = options?.requireToken;
+    if (expectedToken) {
+      const authorization = req.headers.authorization;
+      if (authorization !== `Bearer ${expectedToken}`) {
+        res.statusCode = 401;
+        res.end("unauthorized");
+        return;
+      }
+    }
+
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+
+    if (req.method === "POST" && url.pathname === "/v1/nanopayments/payments") {
+      state.createPaymentCalls += 1;
+      const bodyChunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => bodyChunks.push(chunk));
+      req.on("end", () => {
+        const payload = JSON.parse(Buffer.concat(bodyChunks).toString("utf8")) as Record<string, unknown>;
+        const createPaymentDelayMs = options?.createPaymentDelayMs ?? 0;
+        if (createPaymentDelayMs > 0) {
+          const delayed = setTimeout(() => {
+            if (!res.writableEnded) {
+              res.setHeader("content-type", "application/json");
+              res.end(JSON.stringify({
+                paymentId: "circle-pay-delayed",
+                status: "pending",
+                amount_minor: 42,
+                fee_minor: 1,
+                echoedResource: payload.resource
+              }));
+            }
+          }, createPaymentDelayMs);
+          delayed.unref();
+          return;
+        }
+
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({
+          paymentId: "circle-pay-1",
+          status: "pending",
+          amount_minor: 2500,
+          fee_minor: 5,
+          echoedResource: payload.resource
+        }));
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/nanopayments/payments/circle-pay-1") {
+      state.statusCalls += 1;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({
+        paymentId: "circle-pay-1",
+        status: "succeeded",
+        fee_minor: 5
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end("not-found");
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+
+  const address = server.address() as AddressInfo;
+  const token = options?.requireToken ?? "circle-token";
+  const connectionUri = `circle+http://127.0.0.1:${address.port}?api-key=${encodeURIComponent(token)}&payments-path=${encodeURIComponent("/v1/nanopayments/payments")}`;
+
+  return {
+    connectionUri,
+    state,
+    async close() {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    }
+  };
+}
+
 test("wallet config store encrypts secrets and supports key rotation", async () => {
   const dataDir = await createTempDir("emporion-wallet-config-");
 
@@ -304,6 +415,20 @@ test("wallet config store encrypts secrets and supports key rotation", async () 
 
     const rotated = await store.readConnection("second-key");
     assert.equal(rotated?.endpoint, "https://wallet.example/rpc");
+
+    await store.writeConnection(
+      {
+        backend: "circle",
+        network: "offchain",
+        connectionUri: "circle+https://api.circle.com?api-key=abc",
+        endpoint: "https://api.circle.com/v1/nanopayments/payments",
+        connectedAt: new Date().toISOString()
+      },
+      "second-key"
+    );
+    const circleConnection = await store.readConnection("second-key");
+    assert.equal(circleConnection?.backend, "circle");
+    assert.equal(circleConnection?.network, "offchain");
   } finally {
     await removeTempDir(dataDir);
   }
@@ -334,6 +459,45 @@ test("nwc adapter maps invoice and payment calls and handles timeout/auth errors
     await assert.rejects(() => timeoutAdapter.createInvoice({ amountSats: 700 }), WalletUnavailableError);
   } finally {
     await Promise.all([goodServer.close(), timeoutServer.close()]);
+  }
+});
+
+test("circle x402 adapter parses metadata and maps payment status", async () => {
+  const circleServer = await createMockCircleServer({ requireToken: "circle-good-token" });
+  const timeoutServer = await createMockCircleServer({
+    requireToken: "circle-timeout-token",
+    createPaymentDelayMs: 2_000
+  });
+
+  try {
+    const metadata = parseCircleConnectionMetadata(circleServer.connectionUri.replace("circle-token", "circle-good-token"));
+    assert.equal(metadata.endpoint.includes("/v1/nanopayments/payments"), true);
+
+    const adapter = new CircleX402WalletAdapter(circleServer.connectionUri.replace("circle-token", "circle-good-token"));
+    await assert.rejects(() => adapter.createInvoice({ amountSats: 1000 }), /does not support invoice creation/i);
+
+    const payment = await adapter.payInvoice({ invoice: "https://merchant.example/protected-resource" });
+    assert.equal(payment.externalRef, "circle-pay-1");
+    assert.equal(payment.status, "pending");
+    assert.equal(payment.amountSats, 2500);
+    assert.equal(payment.feeSats, 5);
+
+    const paymentStatus = await adapter.getPaymentStatus(payment.externalRef);
+    assert.equal(paymentStatus.status, "succeeded");
+    assert.equal(paymentStatus.feeSats, 5);
+
+    const unauthorizedAdapter = new CircleX402WalletAdapter(
+      circleServer.connectionUri.replace("circle-good-token", "wrong-token")
+    );
+    await assert.rejects(() => unauthorizedAdapter.payInvoice({ invoice: "https://merchant.example/unauthorized" }), WalletAuthError);
+
+    const timeoutAdapter = new CircleX402WalletAdapter(
+      timeoutServer.connectionUri.replace("circle-token", "circle-timeout-token"),
+      50
+    );
+    await assert.rejects(() => timeoutAdapter.payInvoice({ invoice: "https://merchant.example/slow" }), WalletUnavailableError);
+  } finally {
+    await Promise.all([circleServer.close(), timeoutServer.close()]);
   }
 });
 
@@ -647,6 +811,7 @@ test("wallet CLI commands validate options and usage output includes wallet fami
   const previousKey = process.env.EMPORION_WALLET_KEY;
   const walletPubkey = "c".repeat(64);
   const secret = "d".repeat(64);
+  const circleServer = await createMockCircleServer({ requireToken: "circle-cli-token" });
 
   try {
     delete process.env.EMPORION_WALLET_KEY;
@@ -694,7 +859,38 @@ test("wallet CLI commands validate options and usage output includes wallet fami
       nostrPayload.endpoint.startsWith(`nostr+walletconnect://${walletPubkey}?relay=`),
       true
     );
+    const circleConnectCapture = createCaptureIo();
+    assert.equal(
+      await runCli(
+        [
+          "wallet",
+          "connect",
+          "circle",
+          "--data-dir",
+          dataDir,
+          "--connection-uri",
+          circleServer.connectionUri.replace("circle-token", "circle-cli-token")
+        ],
+        circleConnectCapture.io
+      ),
+      0
+    );
+    const circlePayload = JSON.parse(circleConnectCapture.stdout.join("")) as {
+      command: string;
+      wallet: {
+        connected: boolean;
+        backend: string;
+        network: string;
+      };
+      endpoint: string;
+    };
+    assert.equal(circlePayload.command, "wallet.connect.circle");
+    assert.equal(circlePayload.wallet.connected, true);
+    assert.equal(circlePayload.wallet.backend, "circle");
+    assert.equal(circlePayload.wallet.network, "offchain");
+    assert.equal(circlePayload.endpoint.includes("/v1/nanopayments/payments"), true);
   } finally {
+    await circleServer.close();
     if (previousKey === undefined) {
       delete process.env.EMPORION_WALLET_KEY;
     } else {
@@ -766,6 +962,88 @@ test("wallet connect can be executed through a running daemon without daemon res
     assert.equal(statusPayload.status.wallet.autoSettleEnabled, true);
   } finally {
     await Promise.allSettled([forceStopDaemon(dataDir), bootstrap.destroy(), nwcServer.close(), removeTempDir(dataDir)]);
+    if (previousKey === undefined) {
+      delete process.env.EMPORION_WALLET_KEY;
+    } else {
+      process.env.EMPORION_WALLET_KEY = previousKey;
+    }
+  }
+});
+
+test("wallet pay x402 executes with connected circle backend", async () => {
+  const dataDir = await createTempDir("emporion-wallet-circle-pay-");
+  const circleServer = await createMockCircleServer({ requireToken: "circle-pay-token" });
+  const previousKey = process.env.EMPORION_WALLET_KEY;
+  process.env.EMPORION_WALLET_KEY = "circle-pay-key";
+
+  try {
+    const connectCapture = createCaptureIo();
+    assert.equal(
+      await runCli(
+        [
+          "wallet",
+          "connect",
+          "circle",
+          "--data-dir",
+          dataDir,
+          "--connection-uri",
+          circleServer.connectionUri.replace("circle-token", "circle-pay-token")
+        ],
+        connectCapture.io
+      ),
+      0
+    );
+
+    const payCapture = createCaptureIo();
+    assert.equal(
+      await runCli(
+        [
+          "wallet",
+          "pay",
+          "x402",
+          "--data-dir",
+          dataDir,
+          "--resource",
+          "https://merchant.example/protected-resource"
+        ],
+        payCapture.io
+      ),
+      0
+    );
+
+    const payPayload = JSON.parse(payCapture.stdout.join("")) as {
+      command: string;
+      payment: {
+        externalRef: string;
+        status: string;
+      };
+    };
+    assert.equal(payPayload.command, "wallet.pay.x402");
+    assert.equal(payPayload.payment.externalRef.length > 0, true);
+    assert.equal(payPayload.payment.status, "pending");
+
+    const bolt11OnCircleCapture = createCaptureIo();
+    assert.equal(
+      await runCli(
+        [
+          "wallet",
+          "pay",
+          "bolt11",
+          "--data-dir",
+          dataDir,
+          "--invoice",
+          "lnbc1test"
+        ],
+        bolt11OnCircleCapture.io
+      ),
+      1
+    );
+    assert.equal(
+      bolt11OnCircleCapture.stderr.join("").includes("wallet pay bolt11 is not supported for circle backend"),
+      true
+    );
+  } finally {
+    await Promise.allSettled([circleServer.close(), removeTempDir(dataDir)]);
     if (previousKey === undefined) {
       delete process.env.EMPORION_WALLET_KEY;
     } else {

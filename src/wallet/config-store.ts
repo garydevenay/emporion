@@ -82,11 +82,17 @@ function parseConnectionMetadata(value: unknown): WalletConnectionMetadata {
   }
 
   const record = value as Record<string, unknown>;
-  if (record.backend !== "nwc") {
+  if (record.backend !== "nwc" && record.backend !== "circle") {
     throw new WalletUnavailableError("Wallet metadata backend is invalid");
   }
-  if (record.network !== "bitcoin") {
+  if (record.network !== "bitcoin" && record.network !== "offchain") {
     throw new WalletUnavailableError("Wallet metadata network is invalid");
+  }
+  if (record.backend === "nwc" && record.network !== "bitcoin") {
+    throw new WalletUnavailableError("Wallet metadata network is invalid for nwc backend");
+  }
+  if (record.backend === "circle" && record.network !== "offchain") {
+    throw new WalletUnavailableError("Wallet metadata network is invalid for circle backend");
   }
   if (typeof record.connectedAt !== "string" || record.connectedAt.trim().length === 0) {
     throw new WalletUnavailableError("Wallet metadata connectedAt is invalid");
@@ -96,8 +102,8 @@ function parseConnectionMetadata(value: unknown): WalletConnectionMetadata {
   }
 
   return {
-    backend: "nwc",
-    network: "bitcoin",
+    backend: record.backend,
+    network: record.network,
     connectedAt: record.connectedAt,
     endpoint: record.endpoint
   };

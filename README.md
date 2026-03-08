@@ -385,13 +385,18 @@ Current boundaries:
 - full remote protocol-log synchronization is not yet automatic
 - settlement is metadata and policy driven, not trustless escrow
 
-## Circle Nanopayments Integration (Design Track)
+## Circle Nanopayments Integration (Design + Early Implementation)
 
 Circle's x402-based nanopayment model is now tracked as an explicit adapter design in:
 
 - [docs/architecture/09-circle-nanopayments-adapter.md](./docs/architecture/09-circle-nanopayments-adapter.md)
 
-The current runtime remains Lightning-first (`wallet connect nwc`, `wallet pay bolt11`). The design note defines the migration path to support Circle nano payments without breaking existing flows.
+Current capabilities now include:
+
+- `wallet connect circle` to register a Circle backend
+- `wallet pay x402` to execute Circle/x402 payment requests
+
+Lightning remains fully supported (`wallet connect nwc`, `wallet pay bolt11`). The design note defines the broader migration path for rail-neutral payment references and settlement evolution.
 
 ## Where To Go Next
 

@@ -33,7 +33,10 @@ import { sha256Hex, type ProtocolJsonObject, type ProtocolValue } from "./protoc
 import type { IdentityMaterial } from "./identity.js";
 import { TransportStorage } from "./storage.js";
 import type { TopicRef, TransportConfig } from "./types.js";
-import { WalletService, type AutoSettleCandidate } from "./wallet/index.js";
+import {
+  WalletService,
+  type AutoSettleCandidate
+} from "./wallet/index.js";
 import { ContextStore } from "./context-store.js";
 import { DealsStore, type DealRecord, type DealStage } from "./experience/deals-store.js";
 
@@ -2389,6 +2392,25 @@ async function handleWalletConnectNwc(args: ParsedArgs, io: CliIo): Promise<void
   });
 }
 
+async function handleWalletConnectCircle(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const connectionUri = requireOption(args, "connection-uri");
+  const publishEndpoint = hasFlag(args, "publish-payment-endpoint");
+  if (publishEndpoint) {
+    throw new Error("--publish-payment-endpoint is not yet supported for circle backend");
+  }
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const connected = await context.walletService.connect(connectionUri);
+    writeJson(io, {
+      command: "wallet.connect.circle",
+      wallet: connected.status,
+      endpoint: connected.endpoint
+    });
+  });
+}
+
 async function handleWalletDisconnect(args: ParsedArgs, io: CliIo): Promise<void> {
   const dataDir = requireOption(args, "data-dir");
 
@@ -2475,12 +2497,38 @@ async function handleWalletPayBolt11(args: ParsedArgs, io: CliIo): Promise<void>
 
   await withCliContext(dataDir, async (context) => {
     applyWalletRuntimeKeyFromArgs(context, args);
+    const status = await context.walletService.status();
+    if (status.connected && status.backend === "circle") {
+      throw new Error("wallet pay bolt11 is not supported for circle backend; use wallet pay x402");
+    }
     const paid = await context.walletService.payInvoice({
       invoice,
       ...(sourceRef ? { sourceRef } : {})
     });
     writeJson(io, {
       command: "wallet.pay.bolt11",
+      payment: paid.payment
+    });
+  });
+}
+
+async function handleWalletPayX402(args: ParsedArgs, io: CliIo): Promise<void> {
+  const dataDir = requireOption(args, "data-dir");
+  const resource = requireOption(args, "resource");
+  const sourceRef = getOptionalOption(args, "source-ref");
+
+  await withCliContext(dataDir, async (context) => {
+    applyWalletRuntimeKeyFromArgs(context, args);
+    const status = await context.walletService.status();
+    if (status.connected && status.backend !== "circle") {
+      throw new Error("wallet pay x402 requires a circle backend connection");
+    }
+    const paid = await context.walletService.payInvoice({
+      invoice: resource,
+      ...(sourceRef ? { sourceRef } : {})
+    });
+    writeJson(io, {
+      command: "wallet.pay.x402",
       payment: paid.payment
     });
   });
@@ -2988,12 +3036,14 @@ function usage(): string {
     "  emporion agent init --data-dir <path> [--display-name <name>] [--bio <text>]",
     "  emporion agent show --data-dir <path>",
     "  emporion wallet connect nwc --data-dir <path> --connection-uri <uri> [--publish-payment-endpoint]",
+    "  emporion wallet connect circle --data-dir <path> --connection-uri <uri>",
     "  emporion wallet disconnect --data-dir <path>",
     "  emporion wallet status --data-dir <path>",
     "  emporion wallet unlock [--data-dir <path>|--context <name>] --wallet-key <key-material>",
     "  emporion wallet lock [--data-dir <path>|--context <name>]",
     "  emporion wallet invoice create --data-dir <path> --amount-sats <n> [--memo <text>] [--expires-at <iso>]",
     "  emporion wallet pay bolt11 --data-dir <path> --invoice <bolt11>",
+    "  emporion wallet pay x402 --data-dir <path> --resource <url-or-json>",
     "  emporion wallet ledger list --data-dir <path> [--kind <invoice|payment>] [--status <status>]",
     "  emporion wallet key rotate --data-dir <path> --new-key <key-material>",
     "  emporion deal open [--data-dir <path>|--context <name>] --intent <buy|sell> --marketplace <id> --title <text> --amount-sats <n> [--deal-id <id>]",
@@ -3700,12 +3750,14 @@ async function executeParsedArgs(args: ParsedArgs, io: CliIo, options: DispatchO
   if (commandMatches(resolvedArgs.commandPath, "context", "remove")) return await handleContextRemove(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "agent", "init")) return await handleAgentInit(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "connect", "nwc")) return await handleWalletConnectNwc(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "connect", "circle")) return await handleWalletConnectCircle(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "disconnect")) return await handleWalletDisconnect(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "status")) return await handleWalletStatus(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "unlock")) return await handleWalletUnlock(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "lock")) return await handleWalletLock(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "invoice", "create")) return await handleWalletInvoiceCreate(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "pay", "bolt11")) return await handleWalletPayBolt11(resolvedArgs, io).then(() => 0);
+  if (commandMatches(resolvedArgs.commandPath, "wallet", "pay", "x402")) return await handleWalletPayX402(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "ledger", "list")) return await handleWalletLedgerList(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "wallet", "key", "rotate")) return await handleWalletKeyRotate(resolvedArgs, io).then(() => 0);
   if (commandMatches(resolvedArgs.commandPath, "deal", "open")) return await handleDealOpen(resolvedArgs, io).then(() => 0);

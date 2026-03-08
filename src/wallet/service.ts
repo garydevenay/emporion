@@ -12,6 +12,11 @@ import {
 } from "./config-store.js";
 import { WalletLedger } from "./ledger.js";
 import {
+  CircleX402WalletAdapter,
+  isCircleX402ConnectionUri,
+  parseCircleConnectionMetadata
+} from "./circle-x402-adapter.js";
+import {
   NwcWalletAdapter,
   parseNwcConnectionMetadata
 } from "./nwc-adapter.js";
@@ -58,6 +63,9 @@ function lightningReferenceDedupeKey(ref: LightningReference): string {
 }
 
 function parseWalletConnectionMetadata(connectionUri: string): { endpoint: string } {
+  if (isCircleX402ConnectionUri(connectionUri)) {
+    return parseCircleConnectionMetadata(connectionUri);
+  }
   if (isNostrWalletConnectUri(connectionUri)) {
     return parseNostrWalletConnectMetadata(connectionUri);
   }
@@ -65,6 +73,9 @@ function parseWalletConnectionMetadata(connectionUri: string): { endpoint: strin
 }
 
 function createWalletAdapterForConnection(connectionUri: string): WalletAdapter {
+  if (isCircleX402ConnectionUri(connectionUri)) {
+    return new CircleX402WalletAdapter(connectionUri);
+  }
   if (isNostrWalletConnectUri(connectionUri)) {
     return new NostrWalletConnectAdapter(connectionUri);
   }
@@ -113,10 +124,12 @@ export class WalletService {
   public async connect(connectionUri: string): Promise<{ status: WalletStatus; endpoint: string }> {
     const keyMaterial = this.getWalletKey();
     const metadata = parseWalletConnectionMetadata(connectionUri);
+    const backend = isCircleX402ConnectionUri(connectionUri) ? "circle" : "nwc";
+    const network = backend === "circle" ? "offchain" : "bitcoin";
     await this.configStore.writeConnection(
       {
-        backend: "nwc",
-        network: "bitcoin",
+        backend,
+        network,
         connectionUri,
         endpoint: metadata.endpoint,
         connectedAt: this.now()
@@ -172,8 +185,8 @@ export class WalletService {
 
     return {
       connected: true,
-      backend: "nwc",
-      network: "bitcoin",
+      backend: metadata.backend,
+      network: metadata.network,
       autoSettleEnabled: !locked,
       pendingInvoices,
       pendingPayments,
@@ -195,7 +208,7 @@ export class WalletService {
 
   public async createInvoice(input: CreateInvoiceInput): Promise<CreateInvoiceResult> {
     assertPositiveInteger(input.amountSats, "--amount-sats");
-    const adapter = await this.getUnlockedAdapter();
+    const { adapter, config } = await this.getUnlockedAdapter();
 
     let adapterResult;
     try {
@@ -209,7 +222,7 @@ export class WalletService {
 
     const invoice = await this.ledger.addInvoice({
       amount: input.amountSats,
-      network: "bitcoin",
+      network: config.network,
       externalRef: adapterResult.externalRef,
       bolt11: adapterResult.bolt11,
       status: adapterResult.status,
@@ -225,7 +238,7 @@ export class WalletService {
   }
 
   public async payInvoice(input: PayInvoiceInput): Promise<PayInvoiceResult> {
-    const adapter = await this.getUnlockedAdapter();
+    const { adapter } = await this.getUnlockedAdapter();
 
     let adapterResult;
     try {
@@ -263,7 +276,7 @@ export class WalletService {
       return { updatedInvoices: 0, updatedPayments: 0 };
     }
 
-    const adapter = await this.getUnlockedAdapter();
+    const { adapter } = await this.getUnlockedAdapter();
     let updatedInvoices = 0;
     let updatedPayments = 0;
 
@@ -439,19 +452,22 @@ export class WalletService {
     }
   }
 
-  private async getUnlockedAdapter(): Promise<WalletAdapter> {
+  private async getUnlockedAdapter(): Promise<{ adapter: WalletAdapter; config: { backend: "nwc" | "circle"; network: "bitcoin" | "offchain"; connectionUri: string } }> {
     const key = this.getWalletKey();
     const config = await this.configStore.readConnection(key);
     if (!config) {
       throw new WalletUnavailableError("No wallet connection is configured");
     }
 
-    if (config.backend !== "nwc") {
+    if (config.backend !== "nwc" && config.backend !== "circle") {
       throw new WalletUnavailableError(`Unsupported wallet backend: ${config.backend}`);
     }
 
     if (this.adapterCache && this.adapterCache.connectionUri === config.connectionUri) {
-      return this.adapterCache.adapter;
+      return {
+        adapter: this.adapterCache.adapter,
+        config
+      };
     }
 
     if (this.adapterCache) {
@@ -463,7 +479,10 @@ export class WalletService {
       connectionUri: config.connectionUri,
       adapter
     };
-    return adapter;
+    return {
+      adapter,
+      config
+    };
   }
 
   private getWalletKey(): string {

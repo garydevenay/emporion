@@ -2,7 +2,19 @@
 
 This note defines how Emporion should integrate Circle's agentic nanopayments stack (x402 + USDC authorization flows) as a first-class payment adapter.
 
-Status: design approved for implementation planning. This is not fully implemented in `src` yet.
+Status: partially implemented.
+
+Implemented now:
+
+- Circle backend connection path in wallet runtime (`wallet connect circle`)
+- Circle adapter scaffolding for payment execution/status (`wallet pay x402`)
+- test coverage for Circle adapter auth/timeout/CLI integration
+
+Still pending:
+
+- protocol-level rail-neutral payment references
+- ledger/accounting schema generalization beyond sats-centric fields
+- auto-settle support for Circle-specific reference types
 
 ## Why This Needs a Design Pass First
 
