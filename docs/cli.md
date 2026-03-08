@@ -434,6 +434,8 @@ How to use it:
 
 Wallet commands operate on a local daemon/runtime wallet model. v1 uses an NWC backend and persists ledger records locally only.
 
+Circle/x402 nanopayment support is currently on the design track (not yet implemented in CLI commands). See [Circle Nanopayments Adapter (Design)](./architecture/09-circle-nanopayments-adapter.md).
+
 ### `wallet connect nwc`
 
 Purpose: connect an NWC wallet endpoint and persist the encrypted wallet secret in `<data-dir>/runtime/wallet`.

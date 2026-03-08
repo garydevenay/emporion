@@ -45,6 +45,8 @@ Wallet tests now verify:
   - pending payment recovery after daemon restart
   - daemon startup with locked wallet state when `EMPORION_WALLET_KEY` is missing
 
+Circle/x402 coverage is tracked as a planned expansion in [Circle Nanopayments Adapter (Design)](./09-circle-nanopayments-adapter.md).
+
 ## Operational Expectations
 
 - Losing a local index should be recoverable by replaying logs.

@@ -179,6 +179,8 @@ But v1 does not try to standardize:
 
 That keeps the protocol package focused on economic intent, execution state, and coordination records.
 
+Circle/x402 nanopayment integration planning is documented in [Circle Nanopayments Adapter (Design)](./09-circle-nanopayments-adapter.md).
+
 ## Execution and Coordination
 
 The protocol layer now covers three additional concerns that were previously missing:
