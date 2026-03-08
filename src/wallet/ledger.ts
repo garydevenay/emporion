@@ -46,7 +46,7 @@ function parseInvoice(value: unknown): InvoiceRecord {
   if (!Number.isInteger(entry.amount) || (entry.amount as number) < 0) {
     throw new WalletUnavailableError("Invalid invoice amount in wallet ledger");
   }
-  if (entry.network !== "bitcoin") {
+  if (entry.network !== "bitcoin" && entry.network !== "offchain") {
     throw new WalletUnavailableError("Invalid invoice network in wallet ledger");
   }
   if (typeof entry.createdAt !== "string" || typeof entry.updatedAt !== "string") {
@@ -60,7 +60,7 @@ function parseInvoice(value: unknown): InvoiceRecord {
   return {
     id: entry.id,
     amount,
-    network: "bitcoin",
+    network: entry.network,
     externalRef: entry.externalRef,
     bolt11: entry.bolt11,
     status,

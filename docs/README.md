@@ -22,6 +22,7 @@ If you are contributing to Emporion itself, read [CONTRIBUTING.md](/Users/gary/D
 - [Protocol Repository and Materialized State](./architecture/06-protocol-repository-and-materialized-state.md)
 - [Testing and Operational Notes](./architecture/07-testing-and-operational-notes.md)
 - [Contracts, Proof, Disputes, and Spaces](./architecture/08-contracts-proof-disputes-and-spaces.md)
+- [Circle Nanopayments Adapter (Design)](./architecture/09-circle-nanopayments-adapter.md)
 - [CLI](./cli.md)
 
 ## Specifications
@@ -40,5 +41,6 @@ If you are new to the codebase, read the docs in this order:
 6. `05-protocol-layer-v1.md`
 7. `06-protocol-repository-and-materialized-state.md`
 8. `08-contracts-proof-disputes-and-spaces.md`
+9. `09-circle-nanopayments-adapter.md` (for payment-rail evolution planning)
 
 That path moves from runtime foundations to higher-level economic protocols.

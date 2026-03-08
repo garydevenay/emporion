@@ -1,5 +1,10 @@
 export { WalletService } from "./service.js";
 export {
+  CircleX402WalletAdapter,
+  isCircleX402ConnectionUri,
+  parseCircleConnectionMetadata
+} from "./circle-x402-adapter.js";
+export {
   NostrWalletConnectAdapter,
   isNostrWalletConnectUri,
   parseNostrWalletConnectMetadata

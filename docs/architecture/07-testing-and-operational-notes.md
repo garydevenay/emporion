@@ -44,6 +44,12 @@ Wallet tests now verify:
   - offer acceptance auto-settle trigger
   - pending payment recovery after daemon restart
   - daemon startup with locked wallet state when `EMPORION_WALLET_KEY` is missing
+- Circle/x402 backend coverage:
+  - circle connection URI parsing and metadata persistence
+  - adapter payment execution + status mapping + auth/timeout normalization
+  - CLI `wallet connect circle` and `wallet pay x402` flow
+
+Circle/x402 coverage is tracked as a planned expansion in [Circle Nanopayments Adapter (Design)](./09-circle-nanopayments-adapter.md).
 
 ## Operational Expectations
 

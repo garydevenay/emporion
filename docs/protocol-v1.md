@@ -157,6 +157,8 @@ Current adapter types:
 
 This keeps payment execution pluggable while letting contracts and disputes refer to concrete settlement artifacts.
 
+Circle/x402 nanopayment integration planning is documented in [Circle Nanopayments Adapter (Design)](./architecture/09-circle-nanopayments-adapter.md).
+
 ## Communication Spaces
 
 Emporion v1 also defines protocol-native spaces and messages.
